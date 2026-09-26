@@ -1,0 +1,39 @@
+diff --git a/dlls/secur32/schannel.c b/dlls/secur32/schannel.c
+index 8ce0ac833cf..a02591d4c6c 100644
+--- a/dlls/secur32/schannel.c
++++ b/dlls/secur32/schannel.c
+@@ -1517,15 +1517,17 @@ static SECURITY_STATUS SEC_ENTRY schan_DecryptMessage(PCtxtHandle context_handle
+     expected_size = ctx->header_size + read_record_size(buf_ptr, ctx->header_size);
+     if(buffer->cbBuffer < expected_size)
+     {
++        const ULONG missing = expected_size - buffer->cbBuffer;
++
+         TRACE("Expected %u bytes, but buffer only contains %lu bytes\n", expected_size, buffer->cbBuffer);
+         buffer->BufferType = SECBUFFER_MISSING;
+-        buffer->cbBuffer = expected_size - buffer->cbBuffer;
++        buffer->cbBuffer = missing;
+ 
+         /* This is a bit weird, but windows does it too */
+         idx = schan_find_sec_buffer_idx(message, 0, SECBUFFER_EMPTY);
+         buffer = &message->pBuffers[idx];
+         buffer->BufferType = SECBUFFER_MISSING;
+-        buffer->cbBuffer = expected_size - buffer->cbBuffer;
++        buffer->cbBuffer = missing;
+ 
+         TRACE("Returning SEC_E_INCOMPLETE_MESSAGE\n");
+         return SEC_E_INCOMPLETE_MESSAGE;
+diff --git a/dlls/secur32/tests/schannel.c b/dlls/secur32/tests/schannel.c
+index 2f693c6f871..6f059ffa9d8 100644
+--- a/dlls/secur32/tests/schannel.c
++++ b/dlls/secur32/tests/schannel.c
+@@ -1376,6 +1376,10 @@ static void test_communication(void)
+     ok(status == SEC_E_INCOMPLETE_MESSAGE, "Expected SEC_E_INCOMPLETE_MESSAGE, got %08lx\n", status);
+     ok(buffers[0].pBuffers[0].BufferType == SECBUFFER_MISSING, "Expected first buffer to be SECBUFFER_MISSING\n");
+     ok(buffers[0].pBuffers[0].cbBuffer == 5, "Expected first buffer to be a five bytes\n");
++    ok(buffers[0].pBuffers[1].BufferType == SECBUFFER_MISSING,
++       "Expected second buffer to be SECBUFFER_MISSING, got %lu\n", buffers[0].pBuffers[1].BufferType);
++    ok(buffers[0].pBuffers[1].cbBuffer == 5,
++       "Expected five missing bytes in second buffer, got %lu\n", buffers[0].pBuffers[1].cbBuffer);
+ 
+     /* Renegotiate */
+     buffers[0].pBuffers[0].BufferType = SECBUFFER_DATA;
