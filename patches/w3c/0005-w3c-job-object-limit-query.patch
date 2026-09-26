@@ -1,0 +1,80 @@
+diff --git a/dlls/ntdll/unix/sync.c b/dlls/ntdll/unix/sync.c
+--- a/dlls/ntdll/unix/sync.c
++++ b/dlls/ntdll/unix/sync.c
+@@ -1575,19 +1575,47 @@ NTSTATUS WINAPI NtQueryInformationJobObject( HANDLE handle, JOBOBJECTINFOCLASS c
+     {
+         JOBOBJECT_EXTENDED_LIMIT_INFORMATION *extended_limit = info;
+
+-        if (len < sizeof(*extended_limit)) return STATUS_INFO_LENGTH_MISMATCH;
+-        memset( extended_limit, 0, sizeof(*extended_limit) );
+-        if (ret_len) *ret_len = sizeof(*extended_limit);
+-        return STATUS_SUCCESS;
++        if (len < sizeof(*extended_limit))
++            return STATUS_INFO_LENGTH_MISMATCH;
++
++        SERVER_START_REQ( get_job_info )
++        {
++            req->handle = wine_server_obj_handle( handle );
++            if (!(ret = wine_server_call( req )))
++            {
++                memset( extended_limit, 0, sizeof(*extended_limit) );
++                extended_limit->BasicLimitInformation.LimitFlags = reply->limit_flags;
++            }
++        }
++        SERVER_END_REQ;
++
++        if (!ret && ret_len)
++            *ret_len = sizeof(*extended_limit);
++
++        return ret;
+     }
+     case JobObjectBasicLimitInformation:
+     {
+         JOBOBJECT_BASIC_LIMIT_INFORMATION *basic_limit = info;
+
+-        if (len < sizeof(*basic_limit)) return STATUS_INFO_LENGTH_MISMATCH;
+-        memset( basic_limit, 0, sizeof(*basic_limit) );
+-        if (ret_len) *ret_len = sizeof(*basic_limit);
+-        return STATUS_SUCCESS;
++        if (len < sizeof(*basic_limit))
++            return STATUS_INFO_LENGTH_MISMATCH;
++
++        SERVER_START_REQ( get_job_info )
++        {
++            req->handle = wine_server_obj_handle( handle );
++            if (!(ret = wine_server_call( req )))
++            {
++                memset( basic_limit, 0, sizeof(*basic_limit) );
++                basic_limit->LimitFlags = reply->limit_flags;
++            }
++        }
++        SERVER_END_REQ;
++
++        if (!ret && ret_len)
++            *ret_len = sizeof(*basic_limit);
++
++        return ret;
+     }
+     default:
+         return STATUS_NOT_IMPLEMENTED;
+diff --git a/server/process.c b/server/process.c
+--- a/server/process.c
++++ b/server/process.c
+@@ -1964,6 +1964,7 @@ DECL_HANDLER(get_job_info)
+
+     reply->total_processes = job->total_processes;
+     reply->active_processes = job->num_processes;
++    reply->limit_flags = job->limit_flags;
+
+     len = min( get_reply_max_size(), reply->active_processes * sizeof(*pids) );
+     if (len && ((pids = set_reply_data_size( len ))))
+diff --git a/server/protocol.def b/server/protocol.def
+--- a/server/protocol.def
++++ b/server/protocol.def
+@@ -4167,5 +4167,6 @@ struct handle_info
+ @REPLY
+     int total_processes;          /* total count of processes */
+     int active_processes;         /* count of running processes */
++    unsigned int limit_flags;     /* configured job limit flags */
+     VARARG(pids,uints);           /* list of active pids */
+ @END
