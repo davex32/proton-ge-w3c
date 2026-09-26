@@ -1,0 +1,158 @@
+--- a/server/queue.c
++++ b/server/queue.c
+@@ -490,6 +490,98 @@
+     queue->input = (struct thread_input *)grab_object( new_input );
+ }
+ 
++struct detach_queue
++{
++    struct list entry;
++    struct msg_queue *queue;
++};
++
++static int detach_graph_contains( const struct list *list, const struct msg_queue *queue )
++{
++    const struct detach_queue *entry;
++
++    LIST_FOR_EACH_ENTRY( entry, list, const struct detach_queue, entry )
++        if (entry->queue == queue) return 1;
++    return 0;
++}
++
++static int detach_graph_add( struct list *list, struct msg_queue *queue )
++{
++    struct detach_queue *entry;
++
++    if (detach_graph_contains( list, queue )) return 1;
++    if (!(entry = mem_alloc( sizeof(*entry) ))) return 0;
++    entry->queue = queue;
++    list_add_tail( list, &entry->entry );
++    return 1;
++}
++
++static void detach_graph_free( struct list *list )
++{
++    struct detach_queue *entry, *next;
++
++    LIST_FOR_EACH_ENTRY_SAFE( entry, next, list, struct detach_queue, entry )
++    {
++        list_remove( &entry->entry );
++        free( entry );
++    }
++}
++
++/* Build the connected component containing seed from the remaining attachment edges. */
++static int detach_graph_component( struct thread_input *input, struct msg_queue *seed, struct list *component )
++{
++    struct attachment *attach;
++    int changed;
++
++    list_init( component );
++    if (!detach_graph_add( component, seed )) return 0;
++
++    do
++    {
++        changed = 0;
++        LIST_FOR_EACH_ENTRY( attach, &input->attachments, struct attachment, entry )
++        {
++            int in_from = detach_graph_contains( component, attach->queue_from );
++            int in_to = detach_graph_contains( component, attach->queue_to );
++
++            if (in_from && !in_to)
++            {
++                if (!detach_graph_add( component, attach->queue_to )) goto failed;
++                changed = 1;
++            }
++            else if (in_to && !in_from)
++            {
++                if (!detach_graph_add( component, attach->queue_from )) goto failed;
++                changed = 1;
++            }
++        }
++    } while (changed);
++    return 1;
++
++failed:
++    detach_graph_free( component );
++    return 0;
++}
++
++/* Move one already-discovered connected component, including its internal edges. */
++static void move_detach_component( struct thread_input *old_input, struct list *component,
++                                   struct thread_input *new_input )
++{
++    struct attachment *attach, *next;
++    struct detach_queue *entry;
++
++    LIST_FOR_EACH_ENTRY_SAFE( attach, next, &old_input->attachments, struct attachment, entry )
++    {
++        if (!detach_graph_contains( component, attach->queue_from ) ||
++            !detach_graph_contains( component, attach->queue_to )) continue;
++        list_remove( &attach->entry );
++        list_add_tail( &new_input->attachments, &attach->entry );
++    }
++
++    LIST_FOR_EACH_ENTRY( entry, component, struct detach_queue, entry )
++        assign_thread_input( entry->queue, new_input );
++}
++
+ /* allocate a hardware message and its data */
+ static struct message *alloc_hardware_message( lparam_t info, struct hw_msg_source source,
+                                                unsigned int time, data_size_t extra_size )
+@@ -1538,6 +1630,7 @@
+ {
+     struct thread_input *old_input = queue_from->input, *new_input;
+     struct attachment *attach, *next;
++    struct list component;
+     int count = 0;
+ 
+     LIST_FOR_EACH_ENTRY_SAFE( attach, next, &old_input->attachments, struct attachment, entry )
+@@ -1553,14 +1646,24 @@
+         if (!count) return set_error( STATUS_INVALID_PARAMETER );
+         if (count > 1) return;
+     }
+-    /* TODO: detaching a thread may create two separate thread input graphs */
+ 
+-    if (!(new_input = create_thread_input( desktop ))) return;
+-    assign_thread_input( queue_from, new_input );
++    /* Connected component of queue_from over the remaining attachment edges. */
++    if (!detach_graph_component( old_input, queue_from, &component )) return;
++
++    /* A redundant edge was removed; the graph is still one component. */
++    if (queue_to && detach_graph_contains( &component, queue_to )) goto done;
++
++    /* Genuine split: move the whole queue_from component and its internal edges. */
++    if (!(new_input = create_thread_input( desktop ))) goto done;
++    move_detach_component( old_input, &component, new_input );
+     release_object( new_input );
++
++done:
++    detach_graph_free( &component );
+ }
+ 
+ 
++
+ /* set the next timer to expire */
+ static void set_next_timer( struct msg_queue *queue )
+ {
+--- a/dlls/user32/tests/input.c
++++ b/dlls/user32/tests/input.c
+@@ -5151,6 +5151,18 @@
+     ok_ptr( GetActiveWindow(), ==, args3.hwnd );
+     ok_ptr( GetFocus(), ==, args3.hwnd );
+ 
++    /* detaching one edge of a cycle must not split the still-connected input graph */
++    ok_ret( 1, AttachThreadInput( tid3, tid1, FALSE ) );
++    SetFocus( args3.hwnd );
++    SetActiveWindow( args3.hwnd );
++    ok_ptr( GetActiveWindow(), ==, args3.hwnd );
++    ok_ptr( GetFocus(), ==, args3.hwnd );
++    SetFocus( args1.hwnd );
++    SetActiveWindow( args1.hwnd );
++    ok_ptr( GetActiveWindow(), ==, args1.hwnd );
++    ok_ptr( GetFocus(), ==, args1.hwnd );
++    ok_ret( 1, AttachThreadInput( tid3, tid1, TRUE ) );
++
+     /* all threads are attached */
+     SetFocus( args1.hwnd );
+     SetActiveWindow( args1.hwnd );
