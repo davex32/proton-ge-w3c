@@ -1,0 +1,114 @@
+--- a/server/queue.c
++++ b/server/queue.c
+@@ -582,6 +582,57 @@
+         assign_thread_input( entry->queue, new_input );
+ }
+ 
++/* Find a surviving queue that owns input state which should remain with the old input. */
++static struct msg_queue *get_input_state_owner_queue( struct thread_input *input, struct msg_queue *dying )
++{
++    const user_handle_t handles[] = { input->shared->active, input->shared->focus, input->shared->capture };
++    struct thread *owner;
++    unsigned int i;
++
++    for (i = 0; i < ARRAY_SIZE(handles); i++)
++    {
++        struct msg_queue *queue;
++
++        if (!handles[i] || !(owner = get_window_thread( handles[i] ))) continue;
++        queue = owner->queue;
++        release_object( owner );
++        if (queue && queue != dying && queue->input == input) return queue;
++    }
++    return NULL;
++}
++
++/* Repartition surviving components after an attached queue disappears. */
++static void split_thread_input_after_queue_removal( struct thread_input *input, struct msg_queue *dying,
++                                                    struct list *neighbors )
++{
++    struct detach_queue *entry;
++    struct msg_queue *keeper = get_input_state_owner_queue( input, dying );
++    struct list keeper_component;
++
++    if (list_empty( neighbors )) return;
++    if (!keeper) keeper = LIST_ENTRY( list_head( neighbors ), struct detach_queue, entry )->queue;
++    if (!detach_graph_component( input, keeper, &keeper_component )) return;
++
++    LIST_FOR_EACH_ENTRY( entry, neighbors, struct detach_queue, entry )
++    {
++        struct thread_input *new_input;
++        struct list component;
++
++        if (entry->queue->input != input || detach_graph_contains( &keeper_component, entry->queue )) continue;
++        if (!detach_graph_component( input, entry->queue, &component )) break;
++        if (!(new_input = create_thread_input( input->desktop )))
++        {
++            detach_graph_free( &component );
++            break;
++        }
++        move_detach_component( input, &component, new_input );
++        release_object( new_input );
++        detach_graph_free( &component );
++    }
++
++    detach_graph_free( &keeper_component );
++}
++
+ /* allocate a hardware message and its data */
+ static struct message *alloc_hardware_message( lparam_t info, struct hw_msg_source source,
+                                                unsigned int time, data_size_t extra_size )
+@@ -1467,7 +1518,7 @@
+     struct hotkey *hotkey, *hotkey2;
+     input_shm_t *input_shm = queue->input->shared;
+     struct attachment *attach, *next;
+-    int i;
++    int i, neighbors_complete = 1;
+ 
+     cleanup_results( queue );
+     for (i = 0; i < NB_MSG_KINDS; i++) empty_msg_list( &queue->msg_list[i] );
+@@ -1481,11 +1532,27 @@
+         }
+     }
+ 
+-    LIST_FOR_EACH_ENTRY_SAFE( attach, next, &queue->input->attachments, struct attachment, entry )
+     {
+-        if (attach->queue_from != queue && attach->queue_to != queue) continue;
+-        list_remove( &attach->entry );
+-        free( attach );
++        struct list neighbors = LIST_INIT(neighbors);
++
++        LIST_FOR_EACH_ENTRY_SAFE( attach, next, &queue->input->attachments, struct attachment, entry )
++        {
++            struct msg_queue *other;
++
++            if (attach->queue_from != queue && attach->queue_to != queue) continue;
++            other = attach->queue_from == queue ? attach->queue_to : attach->queue_from;
++            if (neighbors_complete && !detach_graph_add( &neighbors, other ))
++            {
++                detach_graph_free( &neighbors );
++                list_init( &neighbors );
++                neighbors_complete = 0;
++            }
++            list_remove( &attach->entry );
++            free( attach );
++        }
++        if (neighbors_complete && !list_empty( &neighbors ))
++            split_thread_input_after_queue_removal( queue->input, queue, &neighbors );
++        detach_graph_free( &neighbors );
+     }
+ 
+     while ((ptr = list_head( &queue->pending_timers )))
+--- a/dlls/user32/tests/input.c
++++ b/dlls/user32/tests/input.c
+@@ -5203,8 +5203,8 @@
+     ok_ret( 0, WaitForSingleObject( thread1, 5000 ) );
+     ok_ret( 1, CloseHandle( thread1 ) );
+ 
+-    todo_wine ok_ptr( GetActiveWindow(), ==, NULL );
+-    todo_wine ok_ptr( GetFocus(), ==, NULL );
++    ok_ptr( GetActiveWindow(), ==, NULL );
++    ok_ptr( GetFocus(), ==, NULL );
+ 
+     ok_ret( 1, PostMessageA( args3.hwnd, WM_QUIT, 0, 0 ) );
+     ok_ret( 0, WaitForSingleObject( thread3, 5000 ) );
