@@ -416,7 +416,12 @@ apply_all_in_dir() {
     apply_patch "../patches/wine-hotfixes/pending/0001-server-Dynamically-relocate-.exes-by-default-too.patch"
     apply_patch "../patches/wine-hotfixes/pending/0002-ntdll-allow-disabling-executable-ASLR.patch"
 
+
+
 ### END WINE PENDING UPSTREAM SECTION ###
+
+    # Warcraft III / W3Champions fixes
+    apply_all_in_dir "../patches/w3c/"
 
 
 ### (2-7) PROTON-GE ADDITIONAL CUSTOM PATCHES ###

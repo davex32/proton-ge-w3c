@@ -1,0 +1,2322 @@
+diff --git a/dlls/ntdll/unix/virtual.c b/dlls/ntdll/unix/virtual.c
+index 6d97c4f708a..0fc93ed1ec4 100644
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -98,6 +98,7 @@
+ #include "wine/list.h"
+ #include "wine/rbtree.h"
+ #include "unix_private.h"
++#include "wine/w3c_shared_query.h"
+ #include "wine/debug.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(virtual);
+@@ -253,6 +254,7 @@ struct file_view
+     void         *base;          /* base address */
+     size_t        size;          /* size in bytes */
+     unsigned int  protect;       /* protection for all pages at allocation time and SEC_* flags */
++    unsigned int  w3c_slot;      /* shared query slot plus one, or zero */
+ };
+ 
+ /* per-page protection flags */
+@@ -381,6 +383,7 @@ struct range_entry
+ 
+ static struct range_entry *free_ranges;
+ static struct range_entry *free_ranges_end;
++#include "w3c_query_publisher.h"
+ 
+ 
+ static inline BOOL is_beyond_limit( const void *addr, size_t size, const void *limit )
+@@ -950,7 +953,7 @@ void *get_builtin_so_handle( void *module )
+     void *ret = NULL;
+     struct builtin_module *builtin;
+ 
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    w3c_virtual_enter( &sigset );
+     LIST_FOR_EACH_ENTRY( builtin, &builtin_modules, struct builtin_module, entry )
+     {
+         if (builtin->module != module) continue;
+@@ -958,7 +961,7 @@ void *get_builtin_so_handle( void *module )
+         if (ret) builtin->refcount++;
+         break;
+     }
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    w3c_virtual_leave( &sigset );
+     return ret;
+ }
+ 
+@@ -997,7 +1000,7 @@ static NTSTATUS get_builtin_unix_funcs( void *module, BOOL wow, const void **fun
+     NTSTATUS status = STATUS_DLL_NOT_FOUND;
+     struct builtin_module *builtin;
+ 
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    w3c_virtual_enter( &sigset );
+     LIST_FOR_EACH_ENTRY( builtin, &builtin_modules, struct builtin_module, entry )
+     {
+         if (builtin->module != module) continue;
+@@ -1015,7 +1018,7 @@ static NTSTATUS get_builtin_unix_funcs( void *module, BOOL wow, const void **fun
+         }
+         break;
+     }
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    w3c_virtual_leave( &sigset );
+     return status;
+ }
+ 
+@@ -1029,7 +1032,7 @@ NTSTATUS load_builtin_unixlib( void *module, const char *name )
+     NTSTATUS status = STATUS_SUCCESS;
+     struct builtin_module *builtin;
+ 
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    w3c_virtual_enter( &sigset );
+     LIST_FOR_EACH_ENTRY( builtin, &builtin_modules, struct builtin_module, entry )
+     {
+         if (builtin->module != module) continue;
+@@ -1042,7 +1045,7 @@ NTSTATUS load_builtin_unixlib( void *module, const char *name )
+         }
+         break;
+     }
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    w3c_virtual_leave( &sigset );
+     return status;
+ }
+ 
+@@ -1351,6 +1354,7 @@ static void set_page_vprot( const void *addr, size_t size, BYTE vprot )
+ #else
+     memset( pages_vprot + idx, vprot, end - idx );
+ #endif
++    w3c_mirror_vprot( addr, size );
+ }
+ 
+ 
+@@ -1373,6 +1377,7 @@ static void set_page_vprot_bits( const void *addr, size_t size, BYTE set, BYTE c
+ #else
+     for ( ; idx < end; idx++) pages_vprot[idx] = (pages_vprot[idx] & ~clear) | set;
+ #endif
++    if ((set | clear) & ~VPROT_WRITEWATCH) w3c_mirror_vprot( addr, size );
+ }
+ 
+ 
+@@ -1580,12 +1585,12 @@ static void VIRTUAL_Dump(void)
+     struct file_view *view;
+ 
+     TRACE( "Dump of all virtual memory views:\n" );
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    w3c_virtual_enter( &sigset );
+     WINE_RB_FOR_EACH_ENTRY( view, &views_tree, struct file_view, entry )
+     {
+         dump_view( view );
+     }
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    w3c_virtual_leave( &sigset );
+ }
+ #endif
+ 
+@@ -1836,6 +1841,7 @@ static struct file_view *alloc_view(void)
+     {
+         struct file_view *ret = next_free_view;
+         next_free_view = *(struct file_view **)ret;
++        ret->w3c_slot = 0;
+         return ret;
+     }
+     if (view_block_start == view_block_end)
+@@ -1844,6 +1850,7 @@ static struct file_view *alloc_view(void)
+         if (ptr == MAP_FAILED) return NULL;
+         view_block_start = ptr;
+         view_block_end = view_block_start + view_block_size / sizeof(*view_block_start);
++        view_block_start->w3c_slot = 0;
+     }
+     return view_block_start++;
+ }
+@@ -1868,6 +1875,7 @@ static void free_view( struct file_view *view )
+  */
+ static void unregister_view( struct file_view *view )
+ {
++    w3c_unpublish_view( view );
+     free_ranges_remove_view( view );
+     wine_rb_remove( &views_tree, &view->entry );
+ }
+@@ -1897,6 +1905,7 @@ static void register_view( struct file_view *view )
+ {
+     wine_rb_put( &views_tree, view->base, &view->entry );
+     free_ranges_insert_view( view );
++    w3c_publish_view( view );
+ }
+ 
+ 
+@@ -2124,6 +2133,7 @@ static void commit_arm64ec_map( struct file_view *view )
+     void *base = ROUND_ADDR( (char *)arm64ec_view->base + start, page_mask );
+ 
+     view->protect |= VPROT_ARM64EC;
++    w3c_update_view( view );
+     set_vprot( arm64ec_view, base, size, VPROT_READ | VPROT_WRITE | VPROT_COMMITTED );
+ }
+ 
+@@ -2518,6 +2528,7 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
+         TRACE( "found view %p, size %p, protect %#x.\n", view->base, (void *)view->size, view->protect );
+ 
+         view->protect = vprot | VPROT_PLACEHOLDER;
++        w3c_update_view( view );
+         set_vprot( view, base, size, vprot );
+         if (vprot & VPROT_WRITEWATCH)
+         {
+@@ -2798,6 +2809,7 @@ static NTSTATUS free_pages_preserve_placeholder( struct file_view *view, char *b
+     }
+ 
+     view->protect = VPROT_PLACEHOLDER | VPROT_FREE_PLACEHOLDER;
++    w3c_update_view( view );
+     set_page_vprot( view->base, view->size, 0 );
+     anon_mmap_fixed( view->base, ROUND_SIZE( 0, view->size, host_page_mask ), PROT_NONE, 0 );
+     return STATUS_SUCCESS;
+@@ -3667,7 +3679,7 @@ static NTSTATUS virtual_map_image( HANDLE mapping, void **addr_ptr, SIZE_T *size
+         SERVER_END_REQ;
+     }
+ 
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    w3c_virtual_enter( &sigset );
+ 
+     status = map_image_view( &view, image_info, size, limit_low, limit_high, alloc_type );
+     if (status) goto done;
+@@ -3704,7 +3716,7 @@ static NTSTATUS virtual_map_image( HANDLE mapping, void **addr_ptr, SIZE_T *size
+     else delete_view( view );
+ 
+ done:
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    w3c_virtual_leave( &sigset );
+     if (needs_close) close( unix_fd );
+     if (shared_needs_close) close( shared_fd );
+     return status;
+@@ -3811,7 +3823,7 @@ static unsigned int virtual_map_section( HANDLE handle, PVOID *addr_ptr, ULONG_P
+ 
+     if ((res = server_get_unix_fd( handle, 0, &unix_handle, &needs_close, NULL, NULL ))) return res;
+ 
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    w3c_virtual_enter( &sigset );
+ 
+     res = map_view( &view, base, size, alloc_type, vprot, limit_low, limit_high, 0 );
+     if (res) goto done;
+@@ -3845,7 +3857,7 @@ static unsigned int virtual_map_section( HANDLE handle, PVOID *addr_ptr, ULONG_P
+     else delete_view( view );
+ 
+ done:
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    w3c_virtual_leave( &sigset );
+     if (needs_close) close( unix_handle );
+     TRACE("status %#x.\n", res);
+     return res;
+@@ -4010,7 +4022,7 @@ void virtual_get_system_info( SYSTEM_BASIC_INFORMATION *info, BOOL wow64 )
+ #endif
+ 
+     info->unknown                 = 0;
+-    info->KeMaximumIncrement      = 0;  /* FIXME */
++    info->KeMaximumIncrement      = 0;
+     info->PageSize                = page_size;
+     info->MmLowestPhysicalPage    = 1;
+     info->MmNumberOfPhysicalPages = info->MmHighestPhysicalPage - info->MmLowestPhysicalPage;
+@@ -4125,7 +4137,7 @@ NTSTATUS virtual_create_builtin_view( void *module, const UNICODE_STRING *nt_nam
+     void *base = wine_server_get_ptr( info->base );
+     int i;
+ 
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    w3c_virtual_enter( &sigset );
+     status = create_view( &view, base, size, SEC_IMAGE | SEC_FILE | VPROT_SYSTEM |
+                           VPROT_COMMITTED | VPROT_READ | VPROT_WRITECOPY | VPROT_EXEC );
+     if (!status)
+@@ -4162,7 +4174,7 @@ NTSTATUS virtual_create_builtin_view( void *module, const UNICODE_STRING *nt_nam
+         }
+         else delete_view( view );
+     }
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    w3c_virtual_leave( &sigset );
+ 
+     return status;
+ }
+@@ -4337,7 +4349,7 @@ NTSTATUS virtual_alloc_teb( TEB **ret_teb )
+     NTSTATUS status = STATUS_SUCCESS;
+     SIZE_T block_size = signal_stack_mask + 1;
+ 
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    w3c_virtual_enter( &sigset );
+     if (next_free_teb)
+     {
+         ptr = next_free_teb;
+@@ -4353,7 +4365,7 @@ NTSTATUS virtual_alloc_teb( TEB **ret_teb )
+             if ((status = NtAllocateVirtualMemory( NtCurrentProcess(), &ptr, user_space_wow_limit,
+                                                    &total, MEM_RESERVE, PAGE_READWRITE )))
+             {
+-                server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++                w3c_virtual_leave( &sigset );
+                 return status;
+             }
+             teb_block = ptr;
+@@ -4370,7 +4382,7 @@ NTSTATUS virtual_alloc_teb( TEB **ret_teb )
+         *(void **)ptr = next_free_teb;
+         next_free_teb = ptr;
+     }
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    w3c_virtual_leave( &sigset );
+     return status;
+ }
+ 
+@@ -4409,14 +4421,14 @@ void virtual_free_teb( TEB *teb )
+         NtFreeVirtualMemory( GetCurrentProcess(), &ptr, &size, MEM_RELEASE );
+     }
+ 
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    w3c_virtual_enter( &sigset );
+     signal_free_thread( teb );
+     list_remove( &thread_data->entry );
+     ptr = teb;
+     if (!is_win64) ptr = (char *)ptr - teb_offset;
+     *(void **)ptr = next_free_teb;
+     next_free_teb = ptr;
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    w3c_virtual_leave( &sigset );
+ }
+ 
+ 
+@@ -4525,10 +4537,10 @@ NTSTATUS WINAPI NtSetLdtEntries( ULONG sel1, LDT_ENTRY entry1, ULONG sel2, LDT_E
+     if (is_win64 && !is_wow64()) return STATUS_NOT_IMPLEMENTED;
+     if (sel1 >> 16 || sel2 >> 16) return STATUS_INVALID_LDT_DESCRIPTOR;
+ 
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    w3c_virtual_enter( &sigset );
+     if (sel1) ldt_update_entry( sel1, entry1 );
+     if (sel2) ldt_update_entry( sel2, entry2 );
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    w3c_virtual_leave( &sigset );
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -4556,7 +4568,7 @@ NTSTATUS virtual_clear_tls_index( ULONG index )
+ 
+     if (index < TLS_MINIMUM_AVAILABLE)
+     {
+-        server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++        w3c_virtual_enter( &sigset );
+         LIST_FOR_EACH_ENTRY( thread_data, &teb_list, struct ntdll_thread_data, entry )
+         {
+             TEB *teb = CONTAINING_RECORD( thread_data, TEB, GdiTebBatch );
+@@ -4567,14 +4579,14 @@ NTSTATUS virtual_clear_tls_index( ULONG index )
+ #endif
+             teb->TlsSlots[index] = 0;
+         }
+-        server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++        w3c_virtual_leave( &sigset );
+     }
+     else
+     {
+         index -= TLS_MINIMUM_AVAILABLE;
+         if (index >= 8 * sizeof(peb->TlsExpansionBitmapBits)) return STATUS_INVALID_PARAMETER;
+ 
+-        server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++        w3c_virtual_enter( &sigset );
+         LIST_FOR_EACH_ENTRY( thread_data, &teb_list, struct ntdll_thread_data, entry )
+         {
+             TEB *teb = CONTAINING_RECORD( thread_data, TEB, GdiTebBatch );
+@@ -4589,7 +4601,7 @@ NTSTATUS virtual_clear_tls_index( ULONG index )
+ #endif
+             if (teb->TlsExpansionSlots) teb->TlsExpansionSlots[index] = 0;
+         }
+-        server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++        w3c_virtual_leave( &sigset );
+     }
+     return STATUS_SUCCESS;
+ }
+@@ -4674,7 +4686,7 @@ NTSTATUS virtual_set_tls_information( PROCESS_TLS_INFORMATION *t )
+     unsigned int idx = 0;
+     sigset_t sigset;
+ 
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    w3c_virtual_enter( &sigset );
+     LIST_FOR_EACH_ENTRY_REV( thread_data, &teb_list, struct ntdll_thread_data, entry )
+     {
+         TEB *teb = CONTAINING_RECORD( thread_data, TEB, GdiTebBatch );
+@@ -4682,7 +4694,7 @@ NTSTATUS virtual_set_tls_information( PROCESS_TLS_INFORMATION *t )
+         if (idx == t->ThreadDataCount) break;
+         if ((ret = virtual_set_tls_information_teb( t, &idx, teb ))) break;
+     }
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    w3c_virtual_leave( &sigset );
+     return ret;
+ }
+ 
+@@ -4705,7 +4717,7 @@ NTSTATUS virtual_alloc_thread_stack( INITIAL_TEB *stack, ULONG_PTR limit_low, UL
+     if (size < 1024 * 1024) size = 1024 * 1024;  /* Xlib needs a large stack */
+     size = ROUND_SIZE( 0, size, granularity_mask );
+ 
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    w3c_virtual_enter( &sigset );
+ 
+     status = map_view( &view, NULL, size, 0, VPROT_READ | VPROT_WRITE | VPROT_COMMITTED,
+                        limit_low, limit_high, 0 );
+@@ -4738,7 +4750,7 @@ NTSTATUS virtual_alloc_thread_stack( INITIAL_TEB *stack, ULONG_PTR limit_low, UL
+     stack->StackBase = (char *)view->base + view->size;
+     stack->StackLimit = (char *)view->base + (guard_page ? 2 * host_page_size : 0);
+ done:
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    w3c_virtual_leave( &sigset );
+     return status;
+ }
+ 
+@@ -4902,7 +4914,7 @@ NTSTATUS virtual_handle_fault( EXCEPTION_RECORD *rec, void *stack )
+     char *page = ROUND_ADDR( addr, host_page_mask );
+     BYTE vprot;
+ 
+-    mutex_lock( &virtual_mutex );  /* no need for signal masking inside signal handler */
++    w3c_virtual_signal_enter();  /* no need for signal masking inside signal handler */
+     vprot = get_host_page_vprot( page );
+ 
+ #ifdef __APPLE__
+@@ -4948,7 +4960,7 @@ NTSTATUS virtual_handle_fault( EXCEPTION_RECORD *rec, void *stack )
+                 ret = STATUS_SUCCESS;
+         }
+     }
+-    mutex_unlock( &virtual_mutex );
++    w3c_virtual_signal_leave();
+     rec->ExceptionCode = ret;
+     return ret;
+ }
+@@ -4988,13 +5000,13 @@ void *virtual_setup_exception( void *stack_ptr, size_t size, EXCEPTION_RECORD *r
+     else if (stack < stack_info.limit)
+     {
+         char *page = ROUND_ADDR( stack, host_page_mask );
+-        mutex_lock( &virtual_mutex );  /* no need for signal masking inside signal handler */
++        w3c_virtual_signal_enter();  /* no need for signal masking inside signal handler */
+         if ((get_host_page_vprot( page ) & VPROT_GUARD) && grow_thread_stack( page, &stack_info ))
+         {
+             rec->ExceptionCode = STATUS_STACK_OVERFLOW;
+             rec->NumberParameters = 0;
+         }
+-        mutex_unlock( &virtual_mutex );
++        w3c_virtual_signal_leave();
+     }
+ #if defined(VALGRIND_MAKE_MEM_UNDEFINED)
+     VALGRIND_MAKE_MEM_UNDEFINED( stack, size );
+@@ -5043,14 +5055,14 @@ unsigned int virtual_locked_server_call( void *req_ptr )
+ 
+     if (!size) return wine_server_call( req_ptr );
+ 
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    w3c_virtual_enter( &sigset );
+     if (!(ret = check_write_access( addr, size, &has_write_watch )))
+     {
+         ret = server_call_unlocked( req );
+         if (has_write_watch) update_write_watches( addr, size, wine_server_reply_size( req ));
+     }
+     else memset( &req->u.reply, 0, sizeof(req->u.reply) );
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    w3c_virtual_leave( &sigset );
+     return ret;
+ }
+ 
+@@ -5067,14 +5079,14 @@ ssize_t virtual_locked_read( int fd, void *addr, size_t size )
+     ssize_t ret = read( fd, addr, size );
+     if (ret != -1 || use_kernel_writewatch || errno != EFAULT) return ret;
+ 
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    w3c_virtual_enter( &sigset );
+     if (!check_write_access( addr, size, &has_write_watch ))
+     {
+         ret = read( fd, addr, size );
+         err = errno;
+         if (has_write_watch) update_write_watches( addr, size, max( 0, ret ));
+     }
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    w3c_virtual_leave( &sigset );
+     errno = err;
+     return ret;
+ }
+@@ -5092,14 +5104,14 @@ ssize_t virtual_locked_pread( int fd, void *addr, size_t size, off_t offset )
+     ssize_t ret = pread( fd, addr, size, offset );
+     if (ret != -1 || use_kernel_writewatch || errno != EFAULT) return ret;
+ 
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    w3c_virtual_enter( &sigset );
+     if (!check_write_access( addr, size, &has_write_watch ))
+     {
+         ret = pread( fd, addr, size, offset );
+         err = errno;
+         if (has_write_watch) update_write_watches( addr, size, max( 0, ret ));
+     }
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    w3c_virtual_leave( &sigset );
+     errno = err;
+     return ret;
+ }
+@@ -5118,7 +5130,7 @@ ssize_t virtual_locked_recvmsg( int fd, struct msghdr *hdr, int flags )
+     ssize_t ret = recvmsg( fd, hdr, flags );
+     if (ret != -1 || use_kernel_writewatch || errno != EFAULT) return ret;
+ 
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    w3c_virtual_enter( &sigset );
+     for (i = 0; i < hdr->msg_iovlen; i++)
+         if (check_write_access( hdr->msg_iov[i].iov_base, hdr->msg_iov[i].iov_len, &has_write_watch ))
+             break;
+@@ -5130,7 +5142,7 @@ ssize_t virtual_locked_recvmsg( int fd, struct msghdr *hdr, int flags )
+     if (has_write_watch)
+         while (i--) update_write_watches( hdr->msg_iov[i].iov_base, hdr->msg_iov[i].iov_len, 0 );
+ 
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    w3c_virtual_leave( &sigset );
+     errno = err;
+     return ret;
+ }
+@@ -5145,10 +5157,10 @@ BOOL virtual_is_valid_code_address( const void *addr, SIZE_T size )
+     BOOL ret = FALSE;
+     sigset_t sigset;
+ 
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    w3c_virtual_enter( &sigset );
+     if ((view = find_view( addr, size )))
+         ret = !(view->protect & VPROT_SYSTEM);  /* system views are not visible to the app */
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    w3c_virtual_leave( &sigset );
+     return ret;
+ }
+ 
+@@ -5235,7 +5247,7 @@ SIZE_T virtual_uninterrupted_read_memory( const void *addr, void *buffer, SIZE_T
+ 
+     if (!size) return 0;
+ 
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    w3c_virtual_enter( &sigset );
+     if ((view = find_view( addr, size )))
+     {
+         if (!(view->protect & VPROT_SYSTEM))
+@@ -5251,7 +5263,7 @@ SIZE_T virtual_uninterrupted_read_memory( const void *addr, void *buffer, SIZE_T
+             }
+         }
+     }
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    w3c_virtual_leave( &sigset );
+     return bytes_read;
+ }
+ 
+@@ -5271,13 +5283,13 @@ NTSTATUS virtual_uninterrupted_write_memory( void *addr, const void *buffer, SIZ
+ 
+     if (!size) return STATUS_SUCCESS;
+ 
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    w3c_virtual_enter( &sigset );
+     if (!(ret = check_write_access( addr, size, &has_write_watch )))
+     {
+         memcpy( addr, buffer, size );
+         if (has_write_watch) update_write_watches( addr, size, size );
+     }
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    w3c_virtual_leave( &sigset );
+     return ret;
+ }
+ 
+@@ -5292,7 +5304,7 @@ void virtual_set_force_exec( BOOL enable )
+     struct file_view *view;
+     sigset_t sigset;
+ 
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    w3c_virtual_enter( &sigset );
+     if (!force_exec_prot != !enable)  /* change all existing views */
+     {
+         force_exec_prot = enable;
+@@ -5310,7 +5322,7 @@ void virtual_set_force_exec( BOOL enable )
+             mprotect_range( view->base, view->size, commit, 0 );
+         }
+     }
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    w3c_virtual_leave( &sigset );
+ }
+ 
+ 
+@@ -5322,7 +5334,7 @@ void virtual_enable_write_exceptions( BOOL enable )
+     struct file_view *view;
+     sigset_t sigset;
+ 
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    w3c_virtual_enter( &sigset );
+     if (!enable_write_exceptions && enable)  /* change all existing views */
+     {
+         WINE_RB_FOR_EACH_ENTRY( view, &views_tree, struct file_view, entry )
+@@ -5330,7 +5342,7 @@ void virtual_enable_write_exceptions( BOOL enable )
+                 mprotect_range( view->base, view->size, 0, 0 );
+     }
+     enable_write_exceptions = enable;
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    w3c_virtual_leave( &sigset );
+ }
+ 
+ 
+@@ -5406,6 +5418,8 @@ static BOOL is_large_address_aware(void)
+  */
+ void virtual_set_large_address_space(void)
+ {
++    sigset_t sigset;
++    w3c_virtual_enter( &sigset );
+     if (is_win64)
+     {
+         if (!is_wow64())
+@@ -5421,10 +5435,15 @@ void virtual_set_large_address_space(void)
+     }
+     else
+     {
+-        if (!is_large_address_aware()) return;
++        if (!is_large_address_aware())
++        {
++            w3c_virtual_leave( &sigset );
++            return;
++        }
+         free_reserved_memory( (char *)0x80000000, address_space_limit );
+     }
+     user_space_limit = working_set_limit = address_space_limit;
++    w3c_virtual_leave( &sigset );
+ }
+ 
+ 
+@@ -5487,7 +5506,7 @@ static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG typ
+ 
+     /* Reserve the memory */
+ 
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    w3c_virtual_enter( &sigset );
+ 
+     if ((type & MEM_RESERVE) || !base)
+     {
+@@ -5545,7 +5564,7 @@ static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG typ
+         dump_memory_statistics();
+     }
+ 
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    w3c_virtual_leave( &sigset );
+ 
+     if (status == STATUS_SUCCESS)
+     {
+@@ -5568,6 +5587,7 @@ NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR z
+ {
+     static const ULONG type_mask = MEM_COMMIT | MEM_RESERVE | MEM_TOP_DOWN | MEM_WRITE_WATCH | MEM_RESET;
+     ULONG_PTR limit;
++    unsigned int status;
+ 
+     TRACE("%p %p %08lx %x %08x\n", process, *ret, *size_ptr, type, protect );
+ 
+@@ -5583,7 +5603,6 @@ NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR z
+     {
+         union apc_call call;
+         union apc_result result;
+-        unsigned int status;
+ 
+         memset( &call, 0, sizeof(call) );
+ 
+@@ -5729,7 +5748,6 @@ NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *s
+     {
+         union apc_call call;
+         union apc_result result;
+-
+         memset( &call, 0, sizeof(call) );
+ 
+         call.virtual_alloc_ex.type         = APC_VIRTUAL_ALLOC_EX;
+@@ -5776,7 +5794,6 @@ NTSTATUS WINAPI NtFreeVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T *si
+     {
+         union apc_call call;
+         union apc_result result;
+-
+         memset( &call, 0, sizeof(call) );
+ 
+         call.virtual_free.type      = APC_VIRTUAL_FREE;
+@@ -5799,7 +5816,7 @@ NTSTATUS WINAPI NtFreeVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T *si
+     if (size) size = ROUND_SIZE( addr, size, page_mask );
+     base = ROUND_ADDR( addr, page_mask );
+ 
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    w3c_virtual_enter( &sigset );
+ 
+     /* avoid freeing the DOS area when a broken app passes a NULL pointer */
+     if (!base)
+@@ -5846,7 +5863,7 @@ NTSTATUS WINAPI NtFreeVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T *si
+     }
+ 
+     dump_memory_statistics();
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    w3c_virtual_leave( &sigset );
+     return status;
+ }
+ 
+@@ -5876,7 +5893,6 @@ NTSTATUS WINAPI NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T
+     {
+         union apc_call call;
+         union apc_result result;
+-
+         memset( &call, 0, sizeof(call) );
+ 
+         call.virtual_protect.type = APC_VIRTUAL_PROTECT;
+@@ -5901,7 +5917,7 @@ NTSTATUS WINAPI NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T
+     size = ROUND_SIZE( addr, size, page_mask );
+     base = ROUND_ADDR( addr, page_mask );
+ 
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    w3c_virtual_enter( &sigset );
+ 
+     if ((view = find_view( base, size )))
+     {
+@@ -5944,7 +5960,7 @@ NTSTATUS WINAPI NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T
+ 
+     if (!status) VIRTUAL_DEBUG_DUMP_VIEW( view );
+ 
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    w3c_virtual_leave( &sigset );
+ 
+     if (status == STATUS_SUCCESS)
+     {
+@@ -6045,7 +6061,7 @@ static unsigned int fill_basic_memory_info( const void *addr, MEMORY_BASIC_INFOR
+ 
+     /* Find the view containing the address */
+ 
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    w3c_virtual_enter( &sigset );
+     view = get_memory_region_size( base, &alloc_base, &alloc_end, &fake_reserved );
+ 
+     /* Fill the info structure */
+@@ -6085,11 +6101,13 @@ static unsigned int fill_basic_memory_info( const void *addr, MEMORY_BASIC_INFOR
+         else if (view->protect & (SEC_FILE | SEC_RESERVE | SEC_COMMIT)) info->Type = MEM_MAPPED;
+         else info->Type = MEM_PRIVATE;
+     }
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    w3c_virtual_leave( &sigset );
+ 
+     return STATUS_SUCCESS;
+ }
+ 
++#include "w3c_query_reader.h"
++
+ /* get basic information about a memory block */
+ static unsigned int get_basic_memory_info( HANDLE process, LPCVOID addr,
+                                            MEMORY_BASIC_INFORMATION *info,
+@@ -6104,11 +6122,21 @@ static unsigned int get_basic_memory_info( HANDLE process, LPCVOID addr,
+     {
+         union apc_call call;
+         union apc_result result;
++        const char *fast_env = getenv( "W3C_SHARED_QUERY" );
++        BOOL initialize = FALSE;
++
++        if (fast_env && !strcmp( fast_env, "1" ) &&
++            !w3c_shared_memory_info( process, addr, info, &initialize ))
++        {
++            if (res_len) *res_len = sizeof(*info);
++            return STATUS_SUCCESS;
++        }
+ 
+         memset( &call, 0, sizeof(call) );
+ 
+         call.virtual_query.type = APC_VIRTUAL_QUERY;
+         call.virtual_query.addr = wine_server_client_ptr( addr );
++        if (initialize) call.virtual_query.__pad = W3C_SHARED_QUERY_MAGIC;
+         status = server_queue_process_apc( process, &call, &result );
+         if (status != STATUS_SUCCESS) return status;
+ 
+@@ -6157,7 +6185,7 @@ static unsigned int get_memory_region_info( HANDLE process, LPCVOID addr, MEMORY
+ 
+     if (is_beyond_limit( base, 1, working_set_limit )) return STATUS_INVALID_PARAMETER;
+ 
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    w3c_virtual_enter( &sigset );
+ 
+     if ((view = get_memory_region_size( base, &region_start, &region_end, &fake_reserved )))
+     {
+@@ -6184,7 +6212,7 @@ static unsigned int get_memory_region_info( HANDLE process, LPCVOID addr, MEMORY
+     {
+         if (!fake_reserved)
+         {
+-            server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++            w3c_virtual_leave( &sigset );
+             return STATUS_INVALID_ADDRESS;
+         }
+         info->AllocationBase = region_start;
+@@ -6194,7 +6222,7 @@ static unsigned int get_memory_region_info( HANDLE process, LPCVOID addr, MEMORY
+         info->CommitSize = 0;
+     }
+ 
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    w3c_virtual_leave( &sigset );
+ 
+     if (res_len) *res_len = sizeof(*info);
+     return STATUS_SUCCESS;
+@@ -6386,7 +6414,7 @@ static NTSTATUS get_working_set_ex( HANDLE process, LPCVOID addr,
+     start = ref[0].addr;
+     end = ref[count - 1].addr + page_size;
+ 
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    w3c_virtual_enter( &sigset );
+     init_fill_working_set_info_data( &data, end );
+ 
+     view = find_view_range( start, end - start );
+@@ -6417,7 +6445,7 @@ static NTSTATUS get_working_set_ex( HANDLE process, LPCVOID addr,
+ 
+     free_fill_working_set_info_data( &data );
+     if (ref != ref_buffer) free( ref );
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    w3c_virtual_leave( &sigset );
+ 
+     if (res_len)
+         *res_len = len;
+@@ -6635,7 +6663,6 @@ NTSTATUS WINAPI NtLockVirtualMemory( HANDLE process, PVOID *addr, SIZE_T *size,
+     {
+         union apc_call call;
+         union apc_result result;
+-
+         memset( &call, 0, sizeof(call) );
+ 
+         call.virtual_lock.type = APC_VIRTUAL_LOCK;
+@@ -6673,7 +6700,6 @@ NTSTATUS WINAPI NtUnlockVirtualMemory( HANDLE process, PVOID *addr, SIZE_T *size
+     {
+         union apc_call call;
+         union apc_result result;
+-
+         memset( &call, 0, sizeof(call) );
+ 
+         call.virtual_unlock.type = APC_VIRTUAL_UNLOCK;
+@@ -6750,7 +6776,6 @@ NTSTATUS WINAPI NtMapViewOfSection( HANDLE handle, HANDLE process, PVOID *addr_p
+     {
+         union apc_call call;
+         union apc_result result;
+-
+         memset( &call, 0, sizeof(call) );
+ 
+         call.map_view.type         = APC_MAP_VIEW;
+@@ -6824,7 +6849,6 @@ NTSTATUS WINAPI NtMapViewOfSectionEx( HANDLE handle, HANDLE process, PVOID *addr
+     {
+         union apc_call call;
+         union apc_result result;
+-
+         memset( &call, 0, sizeof(call) );
+ 
+         call.map_view_ex.type         = APC_MAP_VIEW_EX;
+@@ -6868,7 +6892,6 @@ static NTSTATUS unmap_view_of_section( HANDLE process, PVOID addr, ULONG flags )
+     {
+         union apc_call call;
+         union apc_result result;
+-
+         memset( &call, 0, sizeof(call) );
+ 
+         call.unmap_view.type = APC_UNMAP_VIEW;
+@@ -6879,7 +6902,7 @@ static NTSTATUS unmap_view_of_section( HANDLE process, PVOID addr, ULONG flags )
+         return status;
+     }
+ 
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    w3c_virtual_enter( &sigset );
+     if (!(view = find_view( addr, 0 )) || is_view_valloc( view )) goto done;
+ 
+     if (flags & MEM_PRESERVE_PLACEHOLDER && !(view->protect & VPROT_PLACEHOLDER))
+@@ -6898,7 +6921,7 @@ static NTSTATUS unmap_view_of_section( HANDLE process, PVOID addr, ULONG flags )
+             {
+                 TRACE( "not freeing in-use builtin %p\n", view->base );
+                 builtin->refcount--;
+-                server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++                w3c_virtual_leave( &sigset );
+                 return STATUS_SUCCESS;
+             }
+         }
+@@ -6922,7 +6945,7 @@ static NTSTATUS unmap_view_of_section( HANDLE process, PVOID addr, ULONG flags )
+     }
+     else FIXME( "failed to unmap %p %x\n", view->base, status );
+ done:
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    w3c_virtual_leave( &sigset );
+     return status;
+ }
+ 
+@@ -7057,7 +7080,6 @@ NTSTATUS WINAPI NtFlushVirtualMemory( HANDLE process, LPCVOID *addr_ptr,
+     {
+         union apc_call call;
+         union apc_result result;
+-
+         memset( &call, 0, sizeof(call) );
+ 
+         call.virtual_flush.type = APC_VIRTUAL_FLUSH;
+@@ -7074,7 +7096,7 @@ NTSTATUS WINAPI NtFlushVirtualMemory( HANDLE process, LPCVOID *addr_ptr,
+         return result.virtual_flush.status;
+     }
+ 
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    w3c_virtual_enter( &sigset );
+     if (!(view = find_view( addr, *size_ptr ))) status = STATUS_INVALID_PARAMETER;
+     else
+     {
+@@ -7085,7 +7107,7 @@ NTSTATUS WINAPI NtFlushVirtualMemory( HANDLE process, LPCVOID *addr_ptr,
+             status = STATUS_NOT_MAPPED_DATA;
+ #endif
+     }
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    w3c_virtual_leave( &sigset );
+     return status;
+ }
+ 
+@@ -7112,7 +7134,7 @@ NTSTATUS WINAPI NtGetWriteWatch( HANDLE process, ULONG flags, PVOID base, SIZE_T
+     TRACE( "%p %x %p-%p %p %lu\n", process, flags, base, (char *)base + size,
+            addresses, *count );
+ 
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    w3c_virtual_enter( &sigset );
+ 
+     if (is_write_watch_range( base, size ))
+     {
+@@ -7144,7 +7166,7 @@ NTSTATUS WINAPI NtGetWriteWatch( HANDLE process, ULONG flags, PVOID base, SIZE_T
+     }
+     else status = STATUS_INVALID_PARAMETER;
+ 
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    w3c_virtual_leave( &sigset );
+     return status;
+ }
+ 
+@@ -7165,14 +7187,14 @@ NTSTATUS WINAPI NtResetWriteWatch( HANDLE process, PVOID base, SIZE_T size )
+ 
+     if (!size) return STATUS_INVALID_PARAMETER;
+ 
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    w3c_virtual_enter( &sigset );
+ 
+     if (is_write_watch_range( base, size ))
+         reset_write_watches( base, size );
+     else
+         status = STATUS_INVALID_PARAMETER;
+ 
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    w3c_virtual_leave( &sigset );
+     return status;
+ }
+ 
+@@ -7264,7 +7286,7 @@ NTSTATUS WINAPI NtAreMappedFilesTheSame(PVOID addr1, PVOID addr2)
+ 
+     TRACE("%p %p\n", addr1, addr2);
+ 
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    w3c_virtual_enter( &sigset );
+ 
+     view1 = find_view( addr1, 0 );
+     view2 = find_view( addr2, 0 );
+@@ -7288,7 +7310,7 @@ NTSTATUS WINAPI NtAreMappedFilesTheSame(PVOID addr1, PVOID addr2)
+         SERVER_END_REQ;
+     }
+ 
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    w3c_virtual_leave( &sigset );
+     return status;
+ }
+ 
+@@ -7330,7 +7352,7 @@ static NTSTATUS set_dirty_state_information( ULONG_PTR count, MEMORY_RANGE_ENTRY
+     sigset_t sigset;
+     NTSTATUS ret = STATUS_SUCCESS;
+ 
+-    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
++    w3c_virtual_enter( &sigset );
+     for (i = 0; i < count; i++)
+     {
+         void *base = ROUND_ADDR( addresses[i].VirtualAddress, page_mask );
+@@ -7346,7 +7368,7 @@ static NTSTATUS set_dirty_state_information( ULONG_PTR count, MEMORY_RANGE_ENTRY
+         else if (set_page_vprot_exec_write_protect( base, size ))
+             mprotect_range( base, size, 0, 0 );
+     }
+-    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
++    w3c_virtual_leave( &sigset );
+     return ret;
+ }
+ 
+@@ -7528,7 +7550,6 @@ NTSTATUS WINAPI NtWow64AllocateVirtualMemory64( HANDLE process, ULONG64 *ret, UL
+     {
+         union apc_call call;
+         union apc_result result;
+-
+         memset( &call, 0, sizeof(call) );
+ 
+         call.virtual_alloc.type         = APC_VIRTUAL_ALLOC;
+diff --git a/dlls/ntdll/unix/w3c_query_publisher.h b/dlls/ntdll/unix/w3c_query_publisher.h
+new file mode 100644
+index 00000000000..62a5b423f1b
+--- /dev/null
++++ b/dlls/ntdll/unix/w3c_query_publisher.h
+@@ -0,0 +1,159 @@
++/* Included by virtual.c. LGPL-2.1-or-later.
++ * Mirror Wine allocation metadata and one protection byte per guest page.
++ * Publishing is serialized by virtual_mutex; readers never take that mutex.
++ */
++#if defined(__linux__) && defined(__x86_64__) && defined(_WIN64) && defined(__NR_memfd_create)
++#define W3C_QUERY_SUPPORTED 1
++static struct w3c_query_header *w3c_export;
++static unsigned int w3c_lock_depth;
++static unsigned int w3c_free_slots[W3C_QUERY_SLOTS], w3c_free_count;
++static unsigned char w3c_mirror_blocks[W3C_QUERY_PAGE_BYTES >> 20];
++static unsigned int w3c_mirror_block_count;
++static BOOL w3c_init_attempted;
++
++static void w3c_write_begin(void)
++{
++    if (!w3c_lock_depth++ && w3c_export)
++        __atomic_add_fetch( &w3c_export->sequence, 1, __ATOMIC_SEQ_CST );
++}
++static void w3c_write_end(void)
++{
++    assert( w3c_lock_depth );
++    if (!--w3c_lock_depth && w3c_export)
++    {
++        w3c_export->limit = (ULONG_PTR)working_set_limit;
++        __atomic_add_fetch( &w3c_export->sequence, 1, __ATOMIC_SEQ_CST );
++    }
++}
++static void w3c_update_view( struct file_view *view )
++{
++    struct w3c_query_view *entries;
++    if (!w3c_export || !w3c_export->valid || !view->w3c_slot) return;
++    entries = (void *)((char *)w3c_export + W3C_QUERY_VIEWS_OFFSET);
++    entries[view->w3c_slot - 1].base = (ULONG_PTR)view->base;
++    entries[view->w3c_slot - 1].size = view->size;
++    entries[view->w3c_slot - 1].protect = view->protect;
++    w3c_export->topology++;
++}
++static void w3c_publish_view( struct file_view *view )
++{
++    if (!w3c_export || !w3c_export->valid) return;
++    if (!view->w3c_slot)
++    {
++        if (w3c_free_count) view->w3c_slot = w3c_free_slots[--w3c_free_count];
++        else if (w3c_export->used < W3C_QUERY_SLOTS) view->w3c_slot = ++w3c_export->used;
++        else { w3c_export->valid = 0; return; } /* never publish a truncated map */
++    }
++    w3c_update_view( view );
++}
++static void w3c_unpublish_view( struct file_view *view )
++{
++    struct w3c_query_view *entries;
++    if (!w3c_export || !w3c_export->valid || !view->w3c_slot) return;
++    entries = (void *)((char *)w3c_export + W3C_QUERY_VIEWS_OFFSET);
++    entries[view->w3c_slot - 1].size = 0;
++    w3c_free_slots[w3c_free_count++] = view->w3c_slot;
++    view->w3c_slot = 0;
++    w3c_export->topology++;
++}
++static void w3c_mirror_vprot( const void *addr, size_t size )
++{
++    size_t idx = (ULONG_PTR)addr >> page_shift;
++    size_t end = ((ULONG_PTR)addr + size + page_mask) >> page_shift;
++    BYTE *dest;
++    if (!w3c_export || !w3c_export->valid || idx >= W3C_QUERY_PAGE_BYTES) return;
++    end = min( end, W3C_QUERY_PAGE_BYTES );
++    dest = (BYTE *)w3c_export + W3C_QUERY_META_SIZE;
++    while (idx < end)
++    {
++        size_t block = idx >> pages_vprot_shift, offset = idx & pages_vprot_mask;
++        size_t count = min( end - idx, pages_vprot_mask + 1 - offset );
++        if (!w3c_mirror_blocks[block])
++        {
++            /* Bound metadata memory even with highly scattered mappings. */
++            if (w3c_mirror_block_count == 128) { w3c_export->valid = 0; return; }
++            w3c_mirror_blocks[block] = 1;
++            w3c_mirror_block_count++;
++        }
++        if (block >= pages_vprot_size || !pages_vprot[block]) { w3c_export->valid = 0; return; }
++        memcpy( dest + idx, pages_vprot[block] + offset, count );
++        idx += count;
++    }
++}
++#else
++static void w3c_write_begin(void) {}
++static void w3c_write_end(void) {}
++static void w3c_update_view( struct file_view *view ) {}
++static void w3c_publish_view( struct file_view *view ) {}
++static void w3c_unpublish_view( struct file_view *view ) {}
++static void w3c_mirror_vprot( const void *addr, size_t size ) {}
++#endif
++static void w3c_virtual_enter( sigset_t *sigset )
++{
++    server_enter_uninterrupted_section( &virtual_mutex, sigset );
++    w3c_write_begin();
++}
++static void w3c_virtual_leave( sigset_t *sigset )
++{
++    w3c_write_end();
++    server_leave_uninterrupted_section( &virtual_mutex, sigset );
++}
++static void w3c_virtual_signal_enter(void)
++{
++    mutex_lock( &virtual_mutex );
++    w3c_write_begin();
++}
++static void w3c_virtual_signal_leave(void)
++{
++    w3c_write_end();
++    mutex_unlock( &virtual_mutex );
++}
++void virtual_w3c_query_init(void)
++{
++#ifdef W3C_QUERY_SUPPORTED
++    struct file_view *view;
++    struct w3c_query_header *mapping;
++    char path[64];
++    sigset_t sigset;
++    int fd = -1, readonly_fd = -1;
++    unsigned int status;
++    w3c_virtual_enter( &sigset );
++    if (w3c_init_attempted) goto done;
++    w3c_init_attempted = TRUE;
++    if (!is_win64 || is_wow64() || host_page_size != 4096) goto done;
++    /* MFD_CLOEXEC | MFD_ALLOW_SEALING. No files in the prefix or /tmp. */
++    fd = syscall( __NR_memfd_create, "wine-w3c-query", 3 );
++    if (fd == -1 || ftruncate( fd, W3C_QUERY_FILE_SIZE ) ||
++        fcntl( fd, W3C_F_ADD_SEALS, W3C_SIZE_SEALS )) goto done;
++    mapping = mmap( NULL, W3C_QUERY_FILE_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0 );
++    if (mapping == MAP_FAILED) goto done;
++    mapping->sequence = 1; /* initialized while the outer lock is already held */
++    mapping->magic = W3C_SHARED_QUERY_MAGIC;
++    mapping->version = W3C_QUERY_VERSION;
++    mapping->limit = (ULONG_PTR)working_set_limit;
++    mapping->valid = 1;
++    w3c_export = mapping;
++    WINE_RB_FOR_EACH_ENTRY( view, &views_tree, struct file_view, entry )
++    {
++        w3c_publish_view( view );
++        w3c_mirror_vprot( view->base, view->size );
++        if (!w3c_export->valid) break;
++    }
++    if (!w3c_export->valid) goto done;
++    snprintf( path, sizeof(path), "/proc/self/fd/%d", fd );
++    readonly_fd = open( path, O_RDONLY | O_CLOEXEC );
++    if (readonly_fd == -1) { w3c_export->valid = 0; goto done; }
++    wine_server_send_fd( readonly_fd );
++    SERVER_START_REQ( w3c_register_query )
++    {
++        req->fd = readonly_fd;
++        status = wine_server_call( req );
++    }
++    SERVER_END_REQ;
++    if (status) w3c_export->valid = 0;
++done:
++    if (readonly_fd != -1) close( readonly_fd );
++    if (fd != -1) close( fd );
++    w3c_virtual_leave( &sigset );
++#endif
++}
+diff --git a/dlls/ntdll/unix/w3c_query_reader.h b/dlls/ntdll/unix/w3c_query_reader.h
+new file mode 100644
+index 00000000000..ac8d8cd29e4
+--- /dev/null
++++ b/dlls/ntdll/unix/w3c_query_reader.h
+@@ -0,0 +1,174 @@
++/* Included by virtual.c after fill_basic_memory_info. LGPL-2.1-or-later.
++ * Process-local index, serialized independently of virtual_mutex.
++ * Caches an allocation index only, never cached query answers.
++ */
++#ifdef W3C_QUERY_SUPPORTED
++static pthread_mutex_t w3c_reader_mutex = PTHREAD_MUTEX_INITIALIZER;
++static const struct w3c_query_header *w3c_import;
++static struct w3c_query_view *w3c_index;
++static unsigned int w3c_index_count;
++static unsigned long long w3c_import_id, w3c_index_topology;
++static HANDLE w3c_import_process;
++static unsigned int w3c_server_check_count;
++static int w3c_compare_views( const void *a, const void *b )
++{
++    const struct w3c_query_view *x = a, *y = b;
++    return (x->base > y->base) - (x->base < y->base);
++}
++static BOOL w3c_read_stable( unsigned long long sequence )
++{
++    __atomic_thread_fence( __ATOMIC_SEQ_CST );
++    return sequence == __atomic_load_n( &w3c_import->sequence, __ATOMIC_ACQUIRE );
++}
++/* Same byte comparison as get_vprot_range_size, over the contiguous mirror. */
++static SIZE_T w3c_protection_end( const BYTE *protection, SIZE_T idx, SIZE_T last, BYTE vprot )
++{
++    const unsigned long long repeat = 0x0101010101010101ULL;
++    const unsigned long long mask = repeat * (BYTE)~VPROT_WRITEWATCH;
++    const unsigned long long expected = repeat * (vprot & (BYTE)~VPROT_WRITEWATCH);
++    unsigned long long word;
++    while (idx < last && (idx & 7))
++    {
++        if ((protection[idx] ^ vprot) & (BYTE)~VPROT_WRITEWATCH) return idx;
++        idx++;
++    }
++    while (last - idx >= sizeof(word))
++    {
++        memcpy( &word, protection + idx, sizeof(word) );
++        if ((word & mask) != expected) break;
++        idx += sizeof(word);
++    }
++    while (idx < last && !((protection[idx] ^ vprot) & (BYTE)~VPROT_WRITEWATCH)) idx++;
++    return idx;
++}
++
++static unsigned int w3c_lookup_memory( const void *addr, MEMORY_BASIC_INFORMATION *info )
++{
++    const struct w3c_query_view *entries;
++    const BYTE *protection;
++    unsigned long long base = (ULONG_PTR)ROUND_ADDR( addr, page_mask );
++    unsigned int attempt;
++    for (attempt = 0; attempt < 3; attempt++)
++    {
++        unsigned long long seq, topology, limit, end;
++        unsigned int i, count, lo, hi;
++        struct w3c_query_view view;
++        BYTE vprot;
++        SIZE_T idx, last;
++        seq = __atomic_load_n( &w3c_import->sequence, __ATOMIC_ACQUIRE );
++        if (seq & 1) continue;
++        if (!w3c_import->valid || w3c_import->magic != W3C_SHARED_QUERY_MAGIC ||
++            w3c_import->version != W3C_QUERY_VERSION) return STATUS_NOT_SUPPORTED;
++        limit = w3c_import->limit;
++        if (base >= limit || base >= W3C_QUERY_ADDRESS_LIMIT) return STATUS_NOT_SUPPORTED;
++        topology = w3c_import->topology;
++        if (topology != w3c_index_topology)
++        {
++            count = w3c_import->used;
++            if (count > W3C_QUERY_SLOTS) return STATUS_NOT_SUPPORTED;
++            entries = (const void *)((const char *)w3c_import + W3C_QUERY_VIEWS_OFFSET);
++            w3c_index_count = 0;
++            w3c_index_topology = 0; /* failed copies must never poison the cache */
++            for (i = 0; i < count; i++)
++            {
++                view = entries[i];
++                if (view.size) w3c_index[w3c_index_count++] = view;
++            }
++            if (!w3c_read_stable( seq )) continue;
++            qsort( w3c_index, w3c_index_count, sizeof(*w3c_index), w3c_compare_views );
++            w3c_index_topology = topology;
++            continue; /* acquire a fresh generation after sorting */
++        }
++        lo = 0;
++        hi = w3c_index_count;
++        while (lo < hi)
++        {
++            unsigned int mid = lo + (hi - lo) / 2;
++            if (w3c_index[mid].base <= base) lo = mid + 1;
++            else hi = mid;
++        }
++        memset( info, 0, sizeof(*info) );
++        info->BaseAddress = (void *)(ULONG_PTR)base;
++        if (!lo || base - w3c_index[lo - 1].base >= w3c_index[lo - 1].size)
++        {
++            end = lo < w3c_index_count ? w3c_index[lo].base : limit;
++            if (end <= base) return STATUS_NOT_SUPPORTED;
++            info->RegionSize = end - base;
++            info->State = MEM_FREE;
++            info->Protect = PAGE_NOACCESS;
++        }
++        else
++        {
++            view = w3c_index[lo - 1];
++            /* SEC_RESERVE is valid here; mirror normal fill_basic_memory_info semantics. */
++            end = view.base + view.size;
++            if (end < view.base || end > W3C_QUERY_ADDRESS_LIMIT || (end & page_mask))
++                return STATUS_NOT_SUPPORTED;
++            protection = (const BYTE *)w3c_import + W3C_QUERY_META_SIZE;
++            idx = base >> page_shift;
++            last = end >> page_shift;
++            vprot = protection[idx];
++            idx = w3c_protection_end( protection, idx, last, vprot );
++            info->AllocationBase = (void *)(ULONG_PTR)view.base;
++            info->RegionSize = (idx << page_shift) - base;
++            info->State = (vprot & VPROT_COMMITTED) ? MEM_COMMIT : MEM_RESERVE;
++            info->Protect = (vprot & VPROT_COMMITTED) ? get_win32_prot( vprot, view.protect ) : 0;
++            info->AllocationProtect = get_win32_prot( view.protect, view.protect );
++            if (view.protect & SEC_IMAGE) info->Type = MEM_IMAGE;
++            else if (view.protect & (SEC_FILE | SEC_RESERVE | SEC_COMMIT)) info->Type = MEM_MAPPED;
++            else info->Type = MEM_PRIVATE;
++        }
++        if (w3c_read_stable( seq )) return STATUS_SUCCESS;
++    }
++    return STATUS_NOT_SUPPORTED;
++}
++#endif
++static unsigned int w3c_shared_memory_info( HANDLE process, const void *addr,
++                                           MEMORY_BASIC_INFORMATION *info, BOOL *initialize )
++{
++#ifdef W3C_QUERY_SUPPORTED
++    unsigned long long id = 0;
++    unsigned int status;
++    int fd;
++    const void *mapping;
++    sigset_t sigset;
++    if (!is_win64 || is_wow64()) return STATUS_NOT_SUPPORTED;
++    server_enter_uninterrupted_section( &w3c_reader_mutex, &sigset );
++    if (w3c_import && process == w3c_import_process && ++w3c_server_check_count < 256)
++    {
++        status = w3c_lookup_memory( addr, info );
++        if (!status) goto done;
++    }
++    w3c_server_check_count = 0;
++    status = server_get_w3c_query( process, w3c_import_id, &id, &fd, initialize );
++    if (status || *initialize) goto done;
++    if (fd != -1)
++    {
++        mapping = mmap( NULL, W3C_QUERY_FILE_SIZE, PROT_READ, MAP_SHARED, fd, 0 );
++        close( fd );
++        if (mapping == MAP_FAILED) { status = STATUS_NOT_SUPPORTED; goto done; }
++        if (w3c_import) munmap( (void *)w3c_import, W3C_QUERY_FILE_SIZE );
++        w3c_import = mapping;
++        w3c_import_id = id;
++        w3c_index_topology = 0;
++    }
++    if (!w3c_import || id != w3c_import_id) { status = STATUS_NOT_SUPPORTED; goto done; }
++    w3c_import_process = process;
++    if (!w3c_index)
++    {
++        w3c_index = anon_mmap_alloc( W3C_QUERY_SLOTS * sizeof(*w3c_index), PROT_READ | PROT_WRITE );
++        if (w3c_index == MAP_FAILED)
++        {
++            w3c_index = NULL;
++            status = STATUS_NOT_SUPPORTED;
++            goto done;
++        }
++    }
++    status = w3c_lookup_memory( addr, info );
++done:
++    server_leave_uninterrupted_section( &w3c_reader_mutex, &sigset );
++    return *initialize ? STATUS_NOT_SUPPORTED : status;
++#else
++    return STATUS_NOT_SUPPORTED;
++#endif
++}
+diff --git a/include/Makefile.in b/include/Makefile.in
+index 435158167fc..a666e70f584 100644
+--- a/include/Makefile.in
++++ b/include/Makefile.in
+@@ -990,6 +990,7 @@ SOURCES = \
+ 	wine/schrpc.idl \
+ 	wine/server.h \
+ 	wine/server_protocol.h \
++	wine/w3c_shared_query.h \
+ 	wine/strmbase.h \
+ 	wine/svcctl.idl \
+ 	wine/test.h \
+diff --git a/include/wine/w3c_shared_query.h b/include/wine/w3c_shared_query.h
+new file mode 100644
+index 00000000000..024a733a5a9
+--- /dev/null
++++ b/include/wine/w3c_shared_query.h
+@@ -0,0 +1,31 @@
++/* W3C SharedQuery experiment. LGPL-2.1-or-later, same as Wine.
++ * Fixed-width Linux/x86-64 layout. No pointers, no Windows APC ABI changes.
++ */
++#ifndef __WINE_W3C_SHARED_QUERY_H
++#define __WINE_W3C_SHARED_QUERY_H
++#define W3C_SHARED_QUERY_MAGIC 0x57335351u
++#define W3C_QUERY_VERSION 1u
++#define W3C_QUERY_SLOTS 65536u
++#define W3C_QUERY_VIEWS_OFFSET 4096ULL
++#define W3C_QUERY_META_SIZE (W3C_QUERY_VIEWS_OFFSET + W3C_QUERY_SLOTS * 24ULL)
++#define W3C_QUERY_ADDRESS_LIMIT (1ULL << 47)
++#define W3C_QUERY_PAGE_BYTES (W3C_QUERY_ADDRESS_LIMIT >> 12)
++#define W3C_QUERY_FILE_SIZE (W3C_QUERY_META_SIZE + W3C_QUERY_PAGE_BYTES)
++/* Linux constants, kept private to avoid libc/linux fcntl header conflicts. */
++#define W3C_F_ADD_SEALS 1033
++#define W3C_F_GET_SEALS 1034
++#define W3C_SIZE_SEALS 6 /* F_SEAL_SHRINK | F_SEAL_GROW */
++struct w3c_query_header
++{
++    unsigned long long sequence;
++    unsigned long long topology;
++    unsigned long long limit;
++    unsigned int magic, version, valid, used;
++};
++struct w3c_query_view
++{
++    unsigned long long base, size;
++    unsigned int protect, reserved;
++};
++C_ASSERT( sizeof(struct w3c_query_view) == 24 );
++#endif
+diff --git a/server/process.c b/server/process.c
+index 287718adc66..61538195287 100644
+--- a/server/process.c
++++ b/server/process.c
+@@ -29,6 +29,7 @@
+ #include <stdarg.h>
+ #include <stdio.h>
+ #include <stdlib.h>
++#include <sys/stat.h>
+ #include <sys/types.h>
+ #include <sys/time.h>
+ #include <sys/socket.h>
+@@ -60,6 +61,7 @@
+ #include "file.h"
+ #include "handle.h"
+ #include "process.h"
++#include "wine/w3c_shared_query.h"
+ #include "thread.h"
+ #include "request.h"
+ #include "user.h"
+@@ -676,6 +678,9 @@ struct process *create_process( int fd, struct process *parent, unsigned int fla
+     process->sigkill_timeout = NULL;
+     process->sigkill_delay   = TICKS_PER_SEC / 64;
+     process->machine         = native_machine;
++    process->w3c_query_fd      = -1;
++    process->w3c_query_attempted = 0;
++    process->w3c_query_id      = 0;
+     process->unix_pid        = -1;
+     process->exit_code       = STILL_ACTIVE;
+     process->running_threads = 0;
+@@ -817,6 +822,7 @@ static void process_destroy( struct object *obj )
+     }
+     if (process->console) release_object( process->console );
+     if (process->msg_fd) release_object( process->msg_fd );
++    if (process->w3c_query_fd != -1) close( process->w3c_query_fd );
+     if (process->idle_event) release_object( process->idle_event );
+     if (process->id) free_ptid( process->id );
+     if (process->token) release_object( process->token );
+@@ -1172,6 +1178,85 @@ int set_process_debug_flag( struct process *process, int flag )
+ }
+ 
+ /* create a new process */
++
++/* Deliberately narrow: inherited environment in WebView/Battle.net is insufficient. */
++static int w3c_image_name( const struct process *process, const char *name )
++{
++    unsigned int i, start = 0, len = process->imagelen / sizeof(WCHAR);
++    if (!process->image) return 0;
++    for (i = 0; i < len; i++)
++        if (process->image[i] == '\\' || process->image[i] == '/') start = i + 1;
++    if (len - start != strlen( name )) return 0;
++    for (i = start; i < len; i++)
++    {
++        unsigned int c = process->image[i];
++        if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
++        if (c != (unsigned char)name[i - start]) return 0;
++    }
++    return 1;
++}
++
++int w3c_query_allowed( struct process *caller, struct process *target )
++{
++    return caller != target && caller->machine == IMAGE_FILE_MACHINE_AMD64 &&
++           target->machine == IMAGE_FILE_MACHINE_AMD64 &&
++           w3c_image_name( caller, "w3champions.exe" ) &&
++           w3c_image_name( target, "warcraft iii.exe" );
++}
++
++DECL_HANDLER(w3c_register_query)
++{
++    static unsigned __int64 next_id;
++    struct process *process = current->process;
++    struct stat st;
++    int fd = thread_get_inflight_fd( current, req->fd );
++    int seals;
++    if (fd == -1) { set_error( STATUS_INVALID_PARAMETER ); return; }
++#ifdef __linux__
++    if (process->machine == IMAGE_FILE_MACHINE_AMD64 &&
++        w3c_image_name( process, "warcraft iii.exe" ) &&
++        process->w3c_query_attempted && process->w3c_query_fd == -1 &&
++        !fstat( fd, &st ) && st.st_size == W3C_QUERY_FILE_SIZE &&
++        (fcntl( fd, F_GETFL ) & O_ACCMODE) == O_RDONLY &&
++        (seals = fcntl( fd, W3C_F_GET_SEALS )) >= 0 &&
++        (seals & W3C_SIZE_SEALS) == W3C_SIZE_SEALS)
++    {
++        process->w3c_query_fd = fd;
++        process->w3c_query_id = ++next_id;
++        return;
++    }
++#endif
++    close( fd );
++    set_error( STATUS_NOT_SUPPORTED );
++}
++
++DECL_HANDLER(w3c_get_query)
++{
++    struct process *process;
++    if (!(process = get_process_from_handle( req->handle, PROCESS_QUERY_LIMITED_INFORMATION ))) return;
++    if (!w3c_query_allowed( current->process, process ) || !process->running_threads || process->is_terminating)
++        set_error( STATUS_NOT_SUPPORTED );
++    else if (process->w3c_query_fd == -1)
++    {
++        if (!process->w3c_query_attempted)
++        {
++            process->w3c_query_attempted = 1;
++            reply->initialize = 1;
++        }
++        else set_error( STATUS_NOT_SUPPORTED );
++    }
++    else
++    {
++        reply->id = process->w3c_query_id;
++        if (req->cached_id != process->w3c_query_id)
++        {
++            if (send_client_fd( current->process, process->w3c_query_fd, req->handle ))
++                set_error( STATUS_TOO_MANY_OPENED_FILES );
++            else reply->send_fd = 1;
++        }
++    }
++    release_object( process );
++}
+ DECL_HANDLER(new_process)
+ {
+     struct startup_info *info;
+diff --git a/server/process.h b/server/process.h
+index 5d157d66979..a1c282a9fed 100644
+--- a/server/process.h
++++ b/server/process.h
+@@ -50,6 +50,9 @@ struct process
+     struct timeout_user *sigkill_timeout; /* timeout for final SIGKILL */
+     timeout_t            sigkill_delay;   /* delay before final SIGKILL */
+     unsigned short       machine;         /* client machine type */
++    int                  w3c_query_fd;
++    int                  w3c_query_attempted;
++    unsigned __int64     w3c_query_id;
+     int                  unix_pid;        /* Unix pid for final SIGKILL */
+     int                  exit_code;       /* process exit code */
+     int                  running_threads; /* number of threads running in this process */
+diff --git a/server/protocol.def b/server/protocol.def
+index f1b7dee8314..974b0e55124 100644
+--- a/server/protocol.def
++++ b/server/protocol.def
+@@ -4339,6 +4339,21 @@ enum inproc_sync_type
+     VARARG(runtime,bytes);              /* client runtime data */
+ @END
+ 
++/* Register a read-only shared memory-query export for the calling process. */
++@REQ(w3c_register_query)
++    int fd;
++@END
++
++/* Validate the process handle on EVERY query; optionally transfer its export fd. */
++@REQ(w3c_get_query)
++    obj_handle_t handle;
++    unsigned __int64 cached_id;
++@REPLY
++    unsigned __int64 id;
++    int send_fd;
++    int initialize;
++@END
++
+ /* fsync definitions */
+ #define FSYNC_SHM_PAGE_SIZE 0x10000
+ #define FSYNC_USED_BY_SERVER 0x7eadfeef
+diff --git a/server/thread.c b/server/thread.c
+index 435d12ab194..d603c1630c3 100644
+--- a/server/thread.c
++++ b/server/thread.c
+@@ -56,6 +56,7 @@
+ #include "file.h"
+ #include "handle.h"
+ #include "process.h"
++#include "wine/w3c_shared_query.h"
+ #include "thread.h"
+ #include "request.h"
+ #include "user.h"
+@@ -2229,6 +2230,12 @@ DECL_HANDLER(queue_apc)
+         break;
+     }
+ 
++    /* Only the verified W3C -> Warcraft pair may request publisher setup. */
++    if (apc->call.type == APC_VIRTUAL_QUERY &&
++        apc->call.virtual_query.__pad == W3C_SHARED_QUERY_MAGIC &&
++        (!process || !w3c_query_allowed( current->process, process )))
++        apc->call.virtual_query.__pad = 0;
++
+     if (thread)
+     {
+         if (!queue_apc( NULL, thread, apc )) set_error( STATUS_UNSUCCESSFUL );
+
+diff --git a/dlls/ntdll/unix/unix_private.h b/dlls/ntdll/unix/unix_private.h
+--- a/dlls/ntdll/unix/unix_private.h
++++ b/dlls/ntdll/unix/unix_private.h
+@@ -722,5 +722,7 @@
+ 
+ #endif  /* defined(__i386__) || defined(__x86_64__) */
+ 
++extern unsigned int server_get_w3c_query( HANDLE process, unsigned long long cached_id,
++                                         unsigned long long *id, int *fd, BOOL *initialize );
+ 
+ #endif /* __NTDLL_UNIX_PRIVATE_H */
+diff --git a/dlls/ntdll/unix/server.c b/dlls/ntdll/unix/server.c
+--- a/dlls/ntdll/unix/server.c
++++ b/dlls/ntdll/unix/server.c
+@@ -2144,4 +2144,40 @@
+ 
+ #endif /* _WIN64 */
+ 
++unsigned int server_get_w3c_query( HANDLE process, unsigned long long cached_id,
++                                 unsigned long long *id, int *fd, BOOL *initialize )
++{
++    unsigned int status;
++    obj_handle_t received;
++    sigset_t sigset;
++
++    *fd = -1;
++    *initialize = FALSE;
++    server_enter_uninterrupted_section( &fd_cache_mutex, &sigset );
++    SERVER_START_REQ( w3c_get_query )
++    {
++        req->handle = wine_server_obj_handle( process );
++        req->cached_id = cached_id;
++        status = wine_server_call( req );
++        if (!status)
++        {
++            *id = reply->id;
++            *initialize = reply->initialize;
++            if (reply->send_fd)
++            {
++                *fd = wine_server_receive_fd( &received );
++                if (*fd == -1) status = STATUS_NOT_SUPPORTED;
++                else if (received != wine_server_obj_handle( process ))
++                {
++                    close( *fd );
++                    *fd = -1;
++                    status = STATUS_NOT_SUPPORTED;
++                }
++            }
++        }
++    }
++    SERVER_END_REQ;
++    server_leave_uninterrupted_section( &fd_cache_mutex, &sigset );
++    return status;
++}
+ 
+diff --git a/server/process.h b/server/process.h
+--- a/server/process.h
++++ b/server/process.h
+@@ -159,4 +159,5 @@
+ 
+ static const unsigned int default_session_id = 1;
+ 
++extern int w3c_query_allowed( struct process *caller, struct process *target );
+ #endif  /* __WINE_SERVER_PROCESS_H */
+
+diff --git a/dlls/ntdll/unix/unix_private.h b/dlls/ntdll/unix/unix_private.h
+--- a/dlls/ntdll/unix/unix_private.h
++++ b/dlls/ntdll/unix/unix_private.h
+@@ -574,6 +574,7 @@
+     return (~(UINT64)0) >> shift;
+ }
+ 
++extern void virtual_w3c_query_init(void);
+ extern unsigned int server_get_w3c_query( HANDLE process, unsigned long long cached_id,
+                                          unsigned long long *id, int *fd, BOOL *initialize );
+ 
+diff --git a/dlls/ntdll/unix/server.c b/dlls/ntdll/unix/server.c
+--- a/dlls/ntdll/unix/server.c
++++ b/dlls/ntdll/unix/server.c
+@@ -532,6 +532,7 @@
+     case APC_VIRTUAL_QUERY:
+     {
+         MEMORY_BASIC_INFORMATION info;
++        if (call->virtual_query.__pad == W3C_SHARED_QUERY_MAGIC) virtual_w3c_query_init();
+         result->type = call->type;
+         addr = wine_server_get_ptr( call->virtual_query.addr );
+         if ((ULONG_PTR)addr == call->virtual_query.addr)
+
+diff --git a/dlls/ntdll/unix/server.c b/dlls/ntdll/unix/server.c
+--- a/dlls/ntdll/unix/server.c
++++ b/dlls/ntdll/unix/server.c
+@@ -82,6 +82,7 @@
+ #include "winioctl.h"
+ #include "wine/server.h"
+ #include "wine/debug.h"
+ #include "unix_private.h"
++#include "wine/w3c_shared_query.h"
+ #include "ddk/wdm.h"
+ 
+ #include "fsync.h"
+
+diff --git a/dlls/ntdll/unix/server.c b/dlls/ntdll/unix/server.c
+--- a/dlls/ntdll/unix/server.c
++++ b/dlls/ntdll/unix/server.c
+@@ -2024,42 +2024,6 @@
+     return STATUS_NOT_IMPLEMENTED;
+ }
+ 
+-unsigned int server_get_w3c_query( HANDLE process, unsigned long long cached_id,
+-                                 unsigned long long *id, int *fd, BOOL *initialize )
+-{
+-    unsigned int status;
+-    obj_handle_t received;
+-    sigset_t sigset;
+-
+-    *fd = -1;
+-    *initialize = FALSE;
+-    server_enter_uninterrupted_section( &fd_cache_mutex, &sigset );
+-    SERVER_START_REQ( w3c_get_query )
+-    {
+-        req->handle = wine_server_obj_handle( process );
+-        req->cached_id = cached_id;
+-        status = wine_server_call( req );
+-        if (!status)
+-        {
+-            *id = reply->id;
+-            *initialize = reply->initialize;
+-            if (reply->send_fd)
+-            {
+-                *fd = wine_server_receive_fd( &received );
+-                if (*fd == -1) status = STATUS_NOT_SUPPORTED;
+-                else if (received != wine_server_obj_handle( process ))
+-                {
+-                    close( *fd );
+-                    *fd = -1;
+-                    status = STATUS_NOT_SUPPORTED;
+-                }
+-            }
+-        }
+-    }
+-    SERVER_END_REQ;
+-    server_leave_uninterrupted_section( &fd_cache_mutex, &sigset );
+-    return status;
+-}
+ 
+ /**************************************************************************
+  *           NtClose
+@@ -2181,3 +2145,40 @@
+ }
+ 
+ #endif /* _WIN64 */
++
++unsigned int server_get_w3c_query( HANDLE process, unsigned long long cached_id,
++                                 unsigned long long *id, int *fd, BOOL *initialize )
++{
++    unsigned int status;
++    obj_handle_t received;
++    sigset_t sigset;
++
++    *fd = -1;
++    *initialize = FALSE;
++    server_enter_uninterrupted_section( &fd_cache_mutex, &sigset );
++    SERVER_START_REQ( w3c_get_query )
++    {
++        req->handle = wine_server_obj_handle( process );
++        req->cached_id = cached_id;
++        status = wine_server_call( req );
++        if (!status)
++        {
++            *id = reply->id;
++            *initialize = reply->initialize;
++            if (reply->send_fd)
++            {
++                *fd = wine_server_receive_fd( &received );
++                if (*fd == -1) status = STATUS_NOT_SUPPORTED;
++                else if (received != wine_server_obj_handle( process ))
++                {
++                    close( *fd );
++                    *fd = -1;
++                    status = STATUS_NOT_SUPPORTED;
++                }
++            }
++        }
++    }
++    SERVER_END_REQ;
++    server_leave_uninterrupted_section( &fd_cache_mutex, &sigset );
++    return status;
++}
+
+diff --git a/dlls/ntdll/unix/unix_private.h b/dlls/ntdll/unix/unix_private.h
+--- a/dlls/ntdll/unix/unix_private.h
++++ b/dlls/ntdll/unix/unix_private.h
+@@ -574,10 +574,6 @@
+     return (~(UINT64)0) >> shift;
+ }
+ 
+-extern void virtual_w3c_query_init(void);
+-extern unsigned int server_get_w3c_query( HANDLE process, unsigned long long cached_id,
+-                                         unsigned long long *id, int *fd, BOOL *initialize );
+-
+ enum loadorder
+ {
+     LO_INVALID,
+@@ -725,4 +721,8 @@
+ 
+ #endif  /* defined(__i386__) || defined(__x86_64__) */
+ 
++extern void virtual_w3c_query_init(void);
++extern unsigned int server_get_w3c_query( HANDLE process, unsigned long long cached_id,
++                                         unsigned long long *id, int *fd, BOOL *initialize );
++
+ #endif /* __NTDLL_UNIX_PRIVATE_H */
+
+diff --git a/dlls/ntdll/unix/virtual.c b/dlls/ntdll/unix/virtual.c
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -1850,8 +1850,8 @@
+         if (ptr == MAP_FAILED) return NULL;
+         view_block_start = ptr;
+         view_block_end = view_block_start + view_block_size / sizeof(*view_block_start);
+-        view_block_start->w3c_slot = 0;
+     }
++    view_block_start->w3c_slot = 0;
+     return view_block_start++;
+ }
+ 
+
+diff --git a/include/Makefile.in b/include/Makefile.in
+--- a/include/Makefile.in
++++ b/include/Makefile.in
+@@ -990,9 +990,9 @@
+ 	wine/plugplay.idl \
+ 	wine/rbtree.h \
+ 	wine/schrpc.idl \
++	wine/w3c_shared_query.h \
+ 	wine/server.h \
+ 	wine/server_protocol.h \
+-	wine/w3c_shared_query.h \
+ 	wine/strmbase.h \
+ 	wine/svcctl.idl \
+ 	wine/test.h \
+
+diff --git a/server/process.c b/server/process.c
+--- a/server/process.c
++++ b/server/process.c
+@@ -29,8 +29,8 @@
+ #include <stdarg.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+-#include <sys/stat.h>
+ #include <sys/types.h>
++#include <sys/stat.h>
+ #include <sys/time.h>
+ #include <sys/socket.h>
+ #include <unistd.h>
+@@ -680,10 +680,10 @@
+     process->sigkill_timeout = NULL;
+     process->sigkill_delay   = TICKS_PER_SEC / 64;
+     process->machine         = native_machine;
+-    process->w3c_query_fd      = -1;
+-    process->w3c_query_attempted = 0;
+-    process->w3c_query_id      = 0;
+     process->unix_pid        = -1;
++    process->w3c_query_fd = -1;
++    process->w3c_query_attempted = 0;
++    process->w3c_query_id = 0;
+     process->exit_code       = STILL_ACTIVE;
+     process->running_threads = 0;
+     process->user_threads    = 0;
+@@ -825,7 +825,6 @@
+     }
+     if (process->console) release_object( process->console );
+     if (process->msg_fd) release_object( process->msg_fd );
+-    if (process->w3c_query_fd != -1) close( process->w3c_query_fd );
+     if (process->idle_event) release_object( process->idle_event );
+     if (process->id) free_ptid( process->id );
+     if (process->token) release_object( process->token );
+@@ -834,6 +833,7 @@
+     list_remove( &process->rawinput_entry );
+     free( process->rawinput_devices );
+     free( process->dir_cache );
++    if (process->w3c_query_fd != -1) close( process->w3c_query_fd );
+     free( process->image );
+ }
+ 
+@@ -1191,84 +1191,6 @@
+ 
+ /* create a new process */
+ 
+-/* Deliberately narrow: inherited environment in WebView/Battle.net is insufficient. */
+-static int w3c_image_name( const struct process *process, const char *name )
+-{
+-    unsigned int i, start = 0, len = process->imagelen / sizeof(WCHAR);
+-    if (!process->image) return 0;
+-    for (i = 0; i < len; i++)
+-        if (process->image[i] == '\\' || process->image[i] == '/') start = i + 1;
+-    if (len - start != strlen( name )) return 0;
+-    for (i = start; i < len; i++)
+-    {
+-        unsigned int c = process->image[i];
+-        if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+-        if (c != (unsigned char)name[i - start]) return 0;
+-    }
+-    return 1;
+-}
+-
+-int w3c_query_allowed( struct process *caller, struct process *target )
+-{
+-    return caller != target && caller->machine == IMAGE_FILE_MACHINE_AMD64 &&
+-           target->machine == IMAGE_FILE_MACHINE_AMD64 &&
+-           w3c_image_name( caller, "w3champions.exe" ) &&
+-           w3c_image_name( target, "warcraft iii.exe" );
+-}
+-
+-DECL_HANDLER(w3c_register_query)
+-{
+-    static unsigned __int64 next_id;
+-    struct process *process = current->process;
+-    struct stat st;
+-    int fd = thread_get_inflight_fd( current, req->fd );
+-    int seals;
+-    if (fd == -1) { set_error( STATUS_INVALID_PARAMETER ); return; }
+-#ifdef __linux__
+-    if (process->machine == IMAGE_FILE_MACHINE_AMD64 &&
+-        w3c_image_name( process, "warcraft iii.exe" ) &&
+-        process->w3c_query_attempted && process->w3c_query_fd == -1 &&
+-        !fstat( fd, &st ) && st.st_size == W3C_QUERY_FILE_SIZE &&
+-        (fcntl( fd, F_GETFL ) & O_ACCMODE) == O_RDONLY &&
+-        (seals = fcntl( fd, W3C_F_GET_SEALS )) >= 0 &&
+-        (seals & W3C_SIZE_SEALS) == W3C_SIZE_SEALS)
+-    {
+-        process->w3c_query_fd = fd;
+-        process->w3c_query_id = ++next_id;
+-        return;
+-    }
+-#endif
+-    close( fd );
+-    set_error( STATUS_NOT_SUPPORTED );
+-}
+-
+-DECL_HANDLER(w3c_get_query)
+-{
+-    struct process *process;
+-    if (!(process = get_process_from_handle( req->handle, PROCESS_QUERY_LIMITED_INFORMATION ))) return;
+-    if (!w3c_query_allowed( current->process, process ) || !process->running_threads || process->is_terminating)
+-        set_error( STATUS_NOT_SUPPORTED );
+-    else if (process->w3c_query_fd == -1)
+-    {
+-        if (!process->w3c_query_attempted)
+-        {
+-            process->w3c_query_attempted = 1;
+-            reply->initialize = 1;
+-        }
+-        else set_error( STATUS_NOT_SUPPORTED );
+-    }
+-    else
+-    {
+-        reply->id = process->w3c_query_id;
+-        if (req->cached_id != process->w3c_query_id)
+-        {
+-            if (send_client_fd( current->process, process->w3c_query_fd, req->handle ))
+-                set_error( STATUS_TOO_MANY_OPENED_FILES );
+-            else reply->send_fd = 1;
+-        }
+-    }
+-    release_object( process );
+-}
+ DECL_HANDLER(new_process)
+ {
+     struct startup_info *info;
+@@ -2226,3 +2148,82 @@
+         }
+     }
+ }
++
++/* Deliberately narrow: inherited environment in WebView/Battle.net is insufficient. */
++static int w3c_image_name( const struct process *process, const char *name )
++{
++    unsigned int i, start = 0, len = process->imagelen / sizeof(WCHAR);
++    if (!process->image) return 0;
++    for (i = 0; i < len; i++)
++        if (process->image[i] == '\\' || process->image[i] == '/') start = i + 1;
++    if (len - start != strlen( name )) return 0;
++    for (i = start; i < len; i++)
++    {
++        unsigned int c = process->image[i];
++        if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
++        if (c != (unsigned char)name[i - start]) return 0;
++    }
++    return 1;
++}
++
++int w3c_query_allowed( struct process *caller, struct process *target )
++{
++    return caller != target && caller->machine == IMAGE_FILE_MACHINE_AMD64 &&
++           target->machine == IMAGE_FILE_MACHINE_AMD64 &&
++           w3c_image_name( caller, "w3champions.exe" ) &&
++           w3c_image_name( target, "warcraft iii.exe" );
++}
++
++DECL_HANDLER(w3c_register_query)
++{
++    static unsigned __int64 next_id;
++    struct process *process = current->process;
++    struct stat st;
++    int fd = thread_get_inflight_fd( current, req->fd );
++    int seals;
++    if (fd == -1) { set_error( STATUS_INVALID_PARAMETER ); return; }
++#ifdef __linux__
++    if (process->machine == IMAGE_FILE_MACHINE_AMD64 &&
++        w3c_image_name( process, "warcraft iii.exe" ) &&
++        process->w3c_query_attempted && process->w3c_query_fd == -1 &&
++        !fstat( fd, &st ) && st.st_size == W3C_QUERY_FILE_SIZE &&
++        (fcntl( fd, F_GETFL ) & O_ACCMODE) == O_RDONLY &&
++        (seals = fcntl( fd, W3C_F_GET_SEALS )) >= 0 &&
++        (seals & W3C_SIZE_SEALS) == W3C_SIZE_SEALS)
++    {
++        process->w3c_query_fd = fd;
++        process->w3c_query_id = ++next_id;
++        return;
++    }
++#endif
++    close( fd );
++    set_error( STATUS_NOT_SUPPORTED );
++}
++
++DECL_HANDLER(w3c_get_query)
++{
++    struct process *process;
++    if (!(process = get_process_from_handle( req->handle, PROCESS_QUERY_LIMITED_INFORMATION ))) return;
++    if (!w3c_query_allowed( current->process, process ) || !process->running_threads || process->is_terminating)
++        set_error( STATUS_NOT_SUPPORTED );
++    else if (process->w3c_query_fd == -1)
++    {
++        if (!process->w3c_query_attempted)
++        {
++            process->w3c_query_attempted = 1;
++            reply->initialize = 1;
++        }
++        else set_error( STATUS_NOT_SUPPORTED );
++    }
++    else
++    {
++        reply->id = process->w3c_query_id;
++        if (req->cached_id != process->w3c_query_id)
++        {
++            if (send_client_fd( current->process, process->w3c_query_fd, req->handle ))
++                set_error( STATUS_TOO_MANY_OPENED_FILES );
++            else reply->send_fd = 1;
++        }
++    }
++    release_object( process );
++}
+
+diff --git a/server/process.h b/server/process.h
+--- a/server/process.h
++++ b/server/process.h
+@@ -160,4 +160,5 @@
+ static const unsigned int default_session_id = 1;
+ 
+ extern int w3c_query_allowed( struct process *caller, struct process *target );
++
+ #endif  /* __WINE_SERVER_PROCESS_H */
+
+diff --git a/server/protocol.def b/server/protocol.def
+--- a/server/protocol.def
++++ b/server/protocol.def
+@@ -4480,21 +4480,6 @@
+     VARARG(runtime,bytes);              /* client runtime data */
+ @END
+ 
+-/* Register a read-only shared memory-query export for the calling process. */
+-@REQ(w3c_register_query)
+-    int fd;
+-@END
+-
+-/* Validate the process handle on EVERY query; optionally transfer its export fd. */
+-@REQ(w3c_get_query)
+-    obj_handle_t handle;
+-    unsigned __int64 cached_id;
+-@REPLY
+-    unsigned __int64 id;
+-    int send_fd;
+-    int initialize;
+-@END
+-
+ /* fsync definitions */
+ #define FSYNC_SHM_PAGE_SIZE 0x10000
+ #define FSYNC_USED_BY_SERVER 0x7eadfeef
+@@ -4571,3 +4556,18 @@
+ @REPLY
+     unsigned int   status;              /* enum hwnd_dmabuf_status */
+ @END
++
++/* Register a read-only shared memory-query export for the calling process. */
++@REQ(w3c_register_query)
++    int fd;
++@END
++
++/* Validate the process handle on EVERY query; optionally transfer its export fd. */
++@REQ(w3c_get_query)
++    obj_handle_t handle;
++    unsigned __int64 cached_id;
++@REPLY
++    unsigned __int64 id;
++    int send_fd;
++    int initialize;
++@END
+
+diff --git a/include/wine/server_protocol.h b/include/wine/server_protocol.h
+--- a/include/wine/server_protocol.h
++++ b/include/wine/server_protocol.h
+@@ -6417,32 +6417,6 @@
+ };
+ 
+ 
+-struct w3c_register_query_request
+-{
+-    struct request_header __header;
+-    int fd;
+-};
+-struct w3c_register_query_reply
+-{
+-    struct reply_header __header;
+-};
+-
+-
+-struct w3c_get_query_request
+-{
+-    struct request_header __header;
+-    obj_handle_t handle;
+-    unsigned __int64 cached_id;
+-};
+-struct w3c_get_query_reply
+-{
+-    struct reply_header __header;
+-    unsigned __int64 id;
+-    int send_fd;
+-    int initialize;
+-};
+-
+-
+ #define FSYNC_SHM_PAGE_SIZE 0x10000
+ #define FSYNC_USED_BY_SERVER 0x7eadfeef
+ 
+@@ -6561,6 +6535,32 @@
+ };
+ 
+ 
++struct w3c_register_query_request
++{
++    struct request_header __header;
++    int fd;
++};
++struct w3c_register_query_reply
++{
++    struct reply_header __header;
++};
++
++
++struct w3c_get_query_request
++{
++    struct request_header __header;
++    obj_handle_t handle;
++    unsigned __int64 cached_id;
++};
++struct w3c_get_query_reply
++{
++    struct reply_header __header;
++    unsigned __int64 id;
++    int send_fd;
++    int initialize;
++};
++
++
+ enum request
+ {
+     REQ_new_process,
+@@ -6877,8 +6877,6 @@
+     REQ_d3dkmt_object_open_name,
+     REQ_d3dkmt_mutex_acquire,
+     REQ_d3dkmt_mutex_release,
+-    REQ_w3c_register_query,
+-    REQ_w3c_get_query,
+     REQ_fsync_free_shm_idx,
+     REQ_hwnd_list_dmabuf_frames,
+     REQ_hwnd_dmabuf_set_pending,
+@@ -6886,6 +6884,8 @@
+     REQ_hwnd_dmabuf_get_channel_exclusive,
+     REQ_hwnd_dmabuf_claim_channel,
+     REQ_hwnd_dmabuf_release_channel,
++    REQ_w3c_register_query,
++    REQ_w3c_get_query,
+     REQ_NB_REQUESTS
+ };
+ 
+@@ -7207,8 +7207,6 @@
+     struct d3dkmt_object_open_name_request d3dkmt_object_open_name_request;
+     struct d3dkmt_mutex_acquire_request d3dkmt_mutex_acquire_request;
+     struct d3dkmt_mutex_release_request d3dkmt_mutex_release_request;
+-    struct w3c_register_query_request w3c_register_query_request;
+-    struct w3c_get_query_request w3c_get_query_request;
+     struct fsync_free_shm_idx_request fsync_free_shm_idx_request;
+     struct hwnd_list_dmabuf_frames_request hwnd_list_dmabuf_frames_request;
+     struct hwnd_dmabuf_set_pending_request hwnd_dmabuf_set_pending_request;
+@@ -7216,6 +7214,8 @@
+     struct hwnd_dmabuf_get_channel_exclusive_request hwnd_dmabuf_get_channel_exclusive_request;
+     struct hwnd_dmabuf_claim_channel_request hwnd_dmabuf_claim_channel_request;
+     struct hwnd_dmabuf_release_channel_request hwnd_dmabuf_release_channel_request;
++    struct w3c_register_query_request w3c_register_query_request;
++    struct w3c_get_query_request w3c_get_query_request;
+ };
+ union generic_reply
+ {
+@@ -7535,8 +7535,6 @@
+     struct d3dkmt_object_open_name_reply d3dkmt_object_open_name_reply;
+     struct d3dkmt_mutex_acquire_reply d3dkmt_mutex_acquire_reply;
+     struct d3dkmt_mutex_release_reply d3dkmt_mutex_release_reply;
+-    struct w3c_register_query_reply w3c_register_query_reply;
+-    struct w3c_get_query_reply w3c_get_query_reply;
+     struct fsync_free_shm_idx_reply fsync_free_shm_idx_reply;
+     struct hwnd_list_dmabuf_frames_reply hwnd_list_dmabuf_frames_reply;
+     struct hwnd_dmabuf_set_pending_reply hwnd_dmabuf_set_pending_reply;
+@@ -7544,8 +7542,10 @@
+     struct hwnd_dmabuf_get_channel_exclusive_reply hwnd_dmabuf_get_channel_exclusive_reply;
+     struct hwnd_dmabuf_claim_channel_reply hwnd_dmabuf_claim_channel_reply;
+     struct hwnd_dmabuf_release_channel_reply hwnd_dmabuf_release_channel_reply;
++    struct w3c_register_query_reply w3c_register_query_reply;
++    struct w3c_get_query_reply w3c_get_query_reply;
+ };
+ 
+-#define SERVER_PROTOCOL_VERSION 938
++#define SERVER_PROTOCOL_VERSION 939
+ 
+ #endif /* __WINE_WINE_SERVER_PROTOCOL_H */
+diff --git a/server/request_handlers.h b/server/request_handlers.h
+--- a/server/request_handlers.h
++++ b/server/request_handlers.h
+@@ -321,8 +321,6 @@
+ DECL_HANDLER(d3dkmt_object_open_name);
+ DECL_HANDLER(d3dkmt_mutex_acquire);
+ DECL_HANDLER(d3dkmt_mutex_release);
+-DECL_HANDLER(w3c_register_query);
+-DECL_HANDLER(w3c_get_query);
+ DECL_HANDLER(fsync_free_shm_idx);
+ DECL_HANDLER(hwnd_list_dmabuf_frames);
+ DECL_HANDLER(hwnd_dmabuf_set_pending);
+@@ -330,6 +328,8 @@
+ DECL_HANDLER(hwnd_dmabuf_get_channel_exclusive);
+ DECL_HANDLER(hwnd_dmabuf_claim_channel);
+ DECL_HANDLER(hwnd_dmabuf_release_channel);
++DECL_HANDLER(w3c_register_query);
++DECL_HANDLER(w3c_get_query);
+ 
+ typedef void (*req_handler)( const void *req, void *reply );
+ static const req_handler req_handlers[REQ_NB_REQUESTS] =
+@@ -648,8 +648,6 @@
+     (req_handler)req_d3dkmt_object_open_name,
+     (req_handler)req_d3dkmt_mutex_acquire,
+     (req_handler)req_d3dkmt_mutex_release,
+-    (req_handler)req_w3c_register_query,
+-    (req_handler)req_w3c_get_query,
+     (req_handler)req_fsync_free_shm_idx,
+     (req_handler)req_hwnd_list_dmabuf_frames,
+     (req_handler)req_hwnd_dmabuf_set_pending,
+@@ -657,6 +655,8 @@
+     (req_handler)req_hwnd_dmabuf_get_channel_exclusive,
+     (req_handler)req_hwnd_dmabuf_claim_channel,
+     (req_handler)req_hwnd_dmabuf_release_channel,
++    (req_handler)req_w3c_register_query,
++    (req_handler)req_w3c_get_query,
+ };
+ 
+ C_ASSERT( sizeof(abstime_t) == 8 );
+@@ -2466,15 +2466,6 @@
+ C_ASSERT( offsetof(struct d3dkmt_mutex_release_request, fence_value) == 24 );
+ C_ASSERT( offsetof(struct d3dkmt_mutex_release_request, runtime_size) == 32 );
+ C_ASSERT( sizeof(struct d3dkmt_mutex_release_request) == 40 );
+-C_ASSERT( offsetof(struct w3c_register_query_request, fd) == 12 );
+-C_ASSERT( sizeof(struct w3c_register_query_request) == 16 );
+-C_ASSERT( offsetof(struct w3c_get_query_request, handle) == 12 );
+-C_ASSERT( offsetof(struct w3c_get_query_request, cached_id) == 16 );
+-C_ASSERT( sizeof(struct w3c_get_query_request) == 24 );
+-C_ASSERT( offsetof(struct w3c_get_query_reply, id) == 8 );
+-C_ASSERT( offsetof(struct w3c_get_query_reply, send_fd) == 16 );
+-C_ASSERT( offsetof(struct w3c_get_query_reply, initialize) == 20 );
+-C_ASSERT( sizeof(struct w3c_get_query_reply) == 24 );
+ C_ASSERT( offsetof(struct fsync_free_shm_idx_request, shm_idx) == 12 );
+ C_ASSERT( sizeof(struct fsync_free_shm_idx_request) == 16 );
+ C_ASSERT( sizeof(struct fsync_free_shm_idx_reply) == 8 );
+@@ -2510,3 +2501,12 @@
+ C_ASSERT( sizeof(struct hwnd_dmabuf_release_channel_request) == 24 );
+ C_ASSERT( offsetof(struct hwnd_dmabuf_release_channel_reply, status) == 8 );
+ C_ASSERT( sizeof(struct hwnd_dmabuf_release_channel_reply) == 16 );
++C_ASSERT( offsetof(struct w3c_register_query_request, fd) == 12 );
++C_ASSERT( sizeof(struct w3c_register_query_request) == 16 );
++C_ASSERT( offsetof(struct w3c_get_query_request, handle) == 12 );
++C_ASSERT( offsetof(struct w3c_get_query_request, cached_id) == 16 );
++C_ASSERT( sizeof(struct w3c_get_query_request) == 24 );
++C_ASSERT( offsetof(struct w3c_get_query_reply, id) == 8 );
++C_ASSERT( offsetof(struct w3c_get_query_reply, send_fd) == 16 );
++C_ASSERT( offsetof(struct w3c_get_query_reply, initialize) == 20 );
++C_ASSERT( sizeof(struct w3c_get_query_reply) == 24 );
+diff --git a/server/request_trace.h b/server/request_trace.h
+--- a/server/request_trace.h
++++ b/server/request_trace.h
+@@ -3620,24 +3620,6 @@
+     dump_varargs_bytes( ", runtime=", cur_size );
+ }
+ 
+-static void dump_w3c_register_query_request( const struct w3c_register_query_request *req )
+-{
+-    fprintf( stderr, " fd=%d", req->fd );
+-}
+-
+-static void dump_w3c_get_query_request( const struct w3c_get_query_request *req )
+-{
+-    fprintf( stderr, " handle=%04x", req->handle );
+-    dump_uint64( ", cached_id=", &req->cached_id );
+-}
+-
+-static void dump_w3c_get_query_reply( const struct w3c_get_query_reply *req )
+-{
+-    dump_uint64( " id=", &req->id );
+-    fprintf( stderr, ", send_fd=%d", req->send_fd );
+-    fprintf( stderr, ", initialize=%d", req->initialize );
+-}
+-
+ static void dump_fsync_free_shm_idx_request( const struct fsync_free_shm_idx_request *req )
+ {
+     fprintf( stderr, " shm_idx=%08x", req->shm_idx );
+@@ -3712,6 +3694,24 @@
+     fprintf( stderr, " status=%08x", req->status );
+ }
+ 
++static void dump_w3c_register_query_request( const struct w3c_register_query_request *req )
++{
++    fprintf( stderr, " fd=%d", req->fd );
++}
++
++static void dump_w3c_get_query_request( const struct w3c_get_query_request *req )
++{
++    fprintf( stderr, " handle=%04x", req->handle );
++    dump_uint64( ", cached_id=", &req->cached_id );
++}
++
++static void dump_w3c_get_query_reply( const struct w3c_get_query_reply *req )
++{
++    dump_uint64( " id=", &req->id );
++    fprintf( stderr, ", send_fd=%d", req->send_fd );
++    fprintf( stderr, ", initialize=%d", req->initialize );
++}
++
+ typedef void (*dump_func)( const void *req );
+ 
+ static const dump_func req_dumpers[REQ_NB_REQUESTS] =
+@@ -4030,8 +4030,6 @@
+     (dump_func)dump_d3dkmt_object_open_name_request,
+     (dump_func)dump_d3dkmt_mutex_acquire_request,
+     (dump_func)dump_d3dkmt_mutex_release_request,
+-    (dump_func)dump_w3c_register_query_request,
+-    (dump_func)dump_w3c_get_query_request,
+     (dump_func)dump_fsync_free_shm_idx_request,
+     (dump_func)dump_hwnd_list_dmabuf_frames_request,
+     (dump_func)dump_hwnd_dmabuf_set_pending_request,
+@@ -4039,6 +4037,8 @@
+     (dump_func)dump_hwnd_dmabuf_get_channel_exclusive_request,
+     (dump_func)dump_hwnd_dmabuf_claim_channel_request,
+     (dump_func)dump_hwnd_dmabuf_release_channel_request,
++    (dump_func)dump_w3c_register_query_request,
++    (dump_func)dump_w3c_get_query_request,
+ };
+ 
+ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
+@@ -4358,14 +4358,14 @@
+     (dump_func)dump_d3dkmt_mutex_acquire_reply,
+     NULL,
+     NULL,
+-    (dump_func)dump_w3c_get_query_reply,
+-    NULL,
+     (dump_func)dump_hwnd_list_dmabuf_frames_reply,
+     (dump_func)dump_hwnd_dmabuf_set_pending_reply,
+     (dump_func)dump_hwnd_dmabuf_get_channel_reply,
+     (dump_func)dump_hwnd_dmabuf_get_channel_exclusive_reply,
+     (dump_func)dump_hwnd_dmabuf_claim_channel_reply,
+     (dump_func)dump_hwnd_dmabuf_release_channel_reply,
++    NULL,
++    (dump_func)dump_w3c_get_query_reply,
+ };
+ 
+ static const char * const req_names[REQ_NB_REQUESTS] =
+@@ -4684,8 +4684,6 @@
+     "d3dkmt_object_open_name",
+     "d3dkmt_mutex_acquire",
+     "d3dkmt_mutex_release",
+-    "w3c_register_query",
+-    "w3c_get_query",
+     "fsync_free_shm_idx",
+     "hwnd_list_dmabuf_frames",
+     "hwnd_dmabuf_set_pending",
+@@ -4693,6 +4691,8 @@
+     "hwnd_dmabuf_get_channel_exclusive",
+     "hwnd_dmabuf_claim_channel",
+     "hwnd_dmabuf_release_channel",
++    "w3c_register_query",
++    "w3c_get_query",
+ };
+ 
+ static const struct
