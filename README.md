@@ -137,4 +137,6 @@ patches/w3c/
 
 If this fork is useful to you:
 
-[![Ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/davexmachina)
+<a href="https://ko-fi.com/davexmachina" target="_blank">
+  <img src="https://storage.ko-fi.com/cdn/kofi2.png" alt="Support me at ko-fi.com" height="46">
+</a>
