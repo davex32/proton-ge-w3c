@@ -1,0 +1,42 @@
+--- a/server/thread.c
++++ b/server/thread.c
+@@ -1480,13 +1480,34 @@
+         }
+         if (!thread)
+         {
+-            /* then use the first one that accepts a signal */
+-            LIST_FOR_EACH_ENTRY( candidate, &process->thread_list, struct thread, proc_entry )
++            /* For remote memory queries, first try threads other than the
++             * first process thread. Fall back to normal selection if needed.
++             * This avoids repeatedly interrupting the first thread when
++             * another thread can service the query instead.
++             */
++            if (apc->call.type == APC_VIRTUAL_QUERY)
+             {
+-                if (send_thread_signal( candidate, SIGUSR1 ))
++                unsigned int index = 0;
++                LIST_FOR_EACH_ENTRY( candidate, &process->thread_list, struct thread, proc_entry )
+                 {
+-                    thread = candidate;
+-                    break;
++                    if (!index++) continue;
++                    if (candidate->state == TERMINATED) continue;
++                    if (send_thread_signal( candidate, SIGUSR1 ))
++                    {
++                        thread = candidate;
++                        break;
++                    }
++                }
++            }
++            if (!thread)
++            {
++                LIST_FOR_EACH_ENTRY( candidate, &process->thread_list, struct thread, proc_entry )
++                {
++                    if (send_thread_signal( candidate, SIGUSR1 ))
++                    {
++                        thread = candidate;
++                        break;
++                    }
+                 }
+             }
+         }
