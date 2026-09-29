@@ -4,6 +4,10 @@ A focused GE-Proton fork for **Warcraft III 3.0**, **Battle.net**, **W3Champions
 
 This branch is based on **GE-Proton11-7** and keeps the upstream GE-Proton patch stack while adding a small set of Wine compatibility fixes needed for the Warcraft III / W3Champions environment.
 
+## Download 
+You can download the pre-built Proton build from the [Releases Page](https://github.com/davex32/proton-ge-w3c/releases/tag/GE-Proton11-7-W3C)
+
+
 ## Base
 
 - Upstream: [GloriousEggroll/proton-ge-custom](https://github.com/GloriousEggroll/proton-ge-custom)
