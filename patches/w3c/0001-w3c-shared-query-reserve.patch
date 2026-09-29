@@ -1881,7 +1881,7 @@ diff --git a/server/process.c b/server/process.c
  DECL_HANDLER(new_process)
  {
      struct startup_info *info;
-@@ -2226,3 +2148,82 @@
+@@ -2226,3 +2148,81 @@
          }
      }
  }
@@ -1907,7 +1907,6 @@ diff --git a/server/process.c b/server/process.c
 +{
 +    return caller != target && caller->machine == IMAGE_FILE_MACHINE_AMD64 &&
 +           target->machine == IMAGE_FILE_MACHINE_AMD64 &&
-+           w3c_image_name( caller, "w3champions.exe" ) &&
 +           w3c_image_name( target, "warcraft iii.exe" );
 +}
 +
