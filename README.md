@@ -6,7 +6,7 @@ This branch is based on **GE-Proton11-7** and keeps the upstream GE-Proton patch
 
 ## Download
 
-You can download the pre-built Proton build from the [Releases Page](https://github.com/davex32/proton-ge-wc3/releases/tag/GE-Proton11-7-W3C)
+You can download the pre-built Proton build from the [Releases Page](https://github.com/davex32/proton-ge-w3c/releases/tag/GE-Proton11-7-W3C-2)
 
 
 ## Base
