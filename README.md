@@ -2,11 +2,7 @@
 
 A focused GE-Proton fork for **Warcraft III 3.0**, **Battle.net**, **W3Champions**, and **FLO** on Linux.
 
-This branch is based on **GE-Proton11-7** and keeps the upstream GE-Proton patch stack while adding a small set of Wine compatibility fixes needed for the Warcraft III / W3Champions environment.
-
-## Download 
-You can download the pre-built Proton build from the [Releases Page](https://github.com/davex32/proton-ge-w3c/releases/tag/GE-Proton11-7-W3C)
-
+This branch is based on **GE-Proton11-7** and keeps the upstream GE-Proton patch stack while adding a set of Wine compatibility fixes needed for the Warcraft III / W3Champions environment.
 
 ## Base
 
@@ -71,6 +67,40 @@ Adds the socket behavior needed by the W3Champions / FLO UDP setup path:
 
 This fixes FLO socket setup failures such as **WSAENOPROTOOPT / OS Error 10042**.
 
+### Virtual-query thread selection
+
+`0007-w3c-virtual-query-thread-selection.patch`
+
+Prefers secondary threads when delivering virtual memory query APCs to Warcraft III.
+
+### Job membership check with limited query access
+
+`0008-w3c-process-in-job-limited-access.patch`
+
+Lets `IsProcessInJob` accept a process handle opened with `PROCESS_QUERY_LIMITED_INFORMATION`, matching Windows. Without it, W3Champions 1.6.27 fails to adopt the Battle.net-launched game and shows **E3000** at stage `adopt`.
+
+### Windows-style `.mrdata` protection in ntdll
+
+`0009-ntdll-protect-mrdata-like-windows.patch`
+
+Keeps the `Wow64PrepareForException` pointer in ntdll's `.mrdata` section and makes that section read-only once process initialisation completes, with reference-counted unlock for the internal writers, matching Windows.
+
+W3Champions 1.6.27 locates its in-game exception handler through that pointer and verifies the containing page is read-only. Under Wine the pointer lived in writable `.data` and the page was never read-only, so the launcher reported `expected one loader callback slot in KiUserExceptionDispatcher` and failed with **E1019** at stage `readiness`.
+
+### Correct thread selection for cross-process memory reads
+
+`0012-server-skip-dead-threads-for-process-memory.patch`
+
+Wineserver picked the first thread with a Linux thread id to service `process_vm_readv`/`process_vm_writev`, without skipping threads that had already exited. Reads aimed at such a thread fail with `ESRCH`, which surfaced as `STATUS_PARTIAL_COPY`. The patch skips terminated threads and retries with another thread when one disappears, as the older ptrace path already did.
+
+### Windows-style 64-bit thread stack placement
+
+`0013-ntdll-win64-thread-stack-top-down.patch`
+
+Allocates 64-bit thread stacks top-down from the top of the user address space, as Windows does, instead of filling from the bottom. WOW64 stacks remain limited to 4 GB.
+
+This matters because the W3Champions in-game handler branches on the address of the exception `CONTEXT` record: it only takes its code-reading path when that address lies above 4 GB, which is always the case on Windows but never with Wine's bottom-up stacks. With the stacks low, the handler looped until the stack overflowed, freezing the game window.
+
 ## Already provided by GE-Proton
 
 The GE-Proton11-7 base already contains several fixes needed by this setup, so they are intentionally not duplicated in `patches/w3c/`, including:
@@ -127,7 +157,12 @@ patches/w3c/
 ├── 0003-wine-thread-input-detach-graphfix.patch
 ├── 0004-wine-thread-input-destroy-repartition.patch
 ├── 0005-w3c-job-object-limit-query.patch
-└── 0006-w3c-ipv6-v6only-compat.patch
+├── 0006-w3c-ipv6-v6only-compat.patch
+├── 0007-w3c-virtual-query-thread-selection.patch
+├── 0008-w3c-process-in-job-limited-access.patch
+├── 0009-ntdll-protect-mrdata-like-windows.patch
+├── 0012-server-skip-dead-threads-for-process-memory.patch
+└── 0013-ntdll-win64-thread-stack-top-down.patch
 ```
 
 ## Upstream projects
@@ -141,6 +176,4 @@ patches/w3c/
 
 If this fork is useful to you:
 
-<a href="https://ko-fi.com/davexmachina" target="_blank">
-  <img src="https://storage.ko-fi.com/cdn/kofi2.png" alt="Support me at ko-fi.com" height="46">
-</a>
+[![Ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/davexmachina)
