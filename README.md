@@ -67,6 +67,18 @@ Adds the socket behavior needed by the W3Champions / FLO UDP setup path:
 
 This fixes FLO socket setup failures such as **WSAENOPROTOOPT / OS Error 10042**.
 
+### Virtual-query thread selection
+
+`0007-w3c-virtual-query-thread-selection.patch`
+
+Prefers secondary threads when delivering virtual memory query APCs to Warcraft III.
+
+### Job membership check with limited query access
+
+`0008-w3c-process-in-job-limited-access.patch`
+
+Lets `IsProcessInJob` accept a process handle opened with `PROCESS_QUERY_LIMITED_INFORMATION`, matching Windows. Without it, W3Champions 1.6.27 fails to adopt the Battle.net-launched game and shows **E3000** at stage `adopt`.
+
 ## Already provided by GE-Proton
 
 The GE-Proton11-7 base already contains several fixes needed by this setup, so they are intentionally not duplicated in `patches/w3c/`, including:
@@ -123,7 +135,9 @@ patches/w3c/
 ├── 0003-wine-thread-input-detach-graphfix.patch
 ├── 0004-wine-thread-input-destroy-repartition.patch
 ├── 0005-w3c-job-object-limit-query.patch
-└── 0006-w3c-ipv6-v6only-compat.patch
+├── 0006-w3c-ipv6-v6only-compat.patch
+├── 0007-w3c-virtual-query-thread-selection.patch
+└── 0008-w3c-process-in-job-limited-access.patch
 ```
 
 ## Upstream projects

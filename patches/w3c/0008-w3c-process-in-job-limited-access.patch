@@ -1,0 +1,12 @@
+diff --git a/server/process.c b/server/process.c
+--- a/server/process.c
++++ b/server/process.c
+@@ -1952,7 +1952,7 @@ DECL_HANDLER(process_in_job)
+     struct process *process;
+     struct job *job;
+ 
+-    if (!(process = get_process_from_handle( req->process, PROCESS_QUERY_INFORMATION )))
++    if (!(process = get_process_from_handle( req->process, PROCESS_QUERY_LIMITED_INFORMATION )))
+         return;
+ 
+     if (!req->job)

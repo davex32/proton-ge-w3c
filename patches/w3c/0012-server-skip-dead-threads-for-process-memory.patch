@@ -1,0 +1,85 @@
+--- a/server/ptrace.c
++++ b/server/ptrace.c
+@@ -337,7 +337,7 @@
+ 
+     LIST_FOR_EACH_ENTRY( thread, &process->thread_list, struct thread, proc_entry )
+     {
+-        if (thread->unix_pid != -1) return thread;
++        if (thread->unix_pid != -1 && thread->state != TERMINATED) return thread;
+     }
+     set_error( STATUS_PROCESS_IS_TERMINATING );  /* process is dead */
+     return NULL;
+@@ -361,6 +361,11 @@
+     local.iov_base = dest;
+     remote.iov_base = (void *)(unsigned long)ptr;
+     len = process_vm_readv( thread->unix_pid, &local, 1, &remote, 1, 0 );
++    if (len < 0 && errno == ESRCH)  /* thread got killed, retry with another one */
++    {
++        thread->unix_pid = thread->unix_tid = -1;
++        return -2;
++    }
+     if (len < 0 && (errno == ENOSYS || errno == EPERM))
+     {
+         not_supported = 1;
+@@ -396,6 +401,11 @@
+     local.iov_base = (void *)src;
+     remote.iov_base = (void *)(unsigned long)ptr;
+     len = process_vm_writev( thread->unix_pid, &local, 1, &remote, 1, 0 );
++    if (len < 0 && errno == ESRCH)  /* thread got killed, retry with another one */
++    {
++        thread->unix_pid = thread->unix_tid = -1;
++        return -2;
++    }
+     if (len < 0 && (errno == ENOSYS || errno == EPERM))
+     {
+         not_supported = 1;
+@@ -474,18 +484,20 @@
+ /* read data from a process memory space */
+ int read_process_memory( struct process *process, client_ptr_t ptr, data_size_t size, char *dest )
+ {
+-    struct thread *thread = get_ptrace_thread( process );
++    struct thread *thread;
+     int ret;
+ 
+-    if (!thread) return 0;
+-
+     if ((unsigned long)ptr != ptr)
+     {
+         set_error( STATUS_ACCESS_DENIED );
+         return 0;
+     }
+ 
+-    if ((ret = read_process_memory_vm( thread, ptr, size, dest )) != -1) return ret;
++    do
++    {
++        if (!(thread = get_ptrace_thread( process ))) return 0;
++    } while ((ret = read_process_memory_vm( thread, ptr, size, dest )) == -2);
++    if (ret != -1) return ret;
+     return read_process_memory_ptrace( thread, ptr, size, dest );
+ }
+ 
+@@ -589,18 +601,20 @@
+ int write_process_memory( struct process *process, client_ptr_t ptr, data_size_t size, const char *src,
+                           data_size_t *written )
+ {
+-    struct thread *thread = get_ptrace_thread( process );
++    struct thread *thread;
+     int ret;
+ 
+-    if (!thread) return 0;
+-
+     if ((unsigned long)ptr != ptr)
+     {
+         set_error( STATUS_ACCESS_DENIED );
+         return 0;
+     }
+ 
+-    if ((ret = write_process_memory_vm( thread, ptr, size, src, written )) != -1) return ret;
++    do
++    {
++        if (!(thread = get_ptrace_thread( process ))) return 0;
++    } while ((ret = write_process_memory_vm( thread, ptr, size, src, written )) == -2);
++    if (ret != -1) return ret;
+     return write_process_memory_ptrace( thread, ptr, size, src, written );
+ }
+ 

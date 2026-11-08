@@ -1,0 +1,156 @@
+--- a/dlls/ntdll/loader.c
++++ b/dlls/ntdll/loader.c
+@@ -2803,6 +2803,59 @@
+ }
+ 
+ 
++static RTL_SRWLOCK mrdata_lock = RTL_SRWLOCK_INIT;
++static LONG mrdata_unprotected = 1;  /* writable until process initialization completes */
++
++/*************************************************************************
++ *		ldr_protect_mrdata
++ *
++ * Reference-counted protection of ntdll's .mrdata section, like Windows
++ * LdrProtectMrdata: read-only once process initialization completes,
++ * writable while any writer holds an unprotect reference.
++ */
++void ldr_protect_mrdata( BOOL protect )
++{
++    static void *mrdata_base;
++    static SIZE_T mrdata_size;
++    ULONG new_prot = 0, old_prot;
++
++    RtlAcquireSRWLockExclusive( &mrdata_lock );
++    if (!mrdata_base)
++    {
++        MEMORY_BASIC_INFORMATION meminfo;
++        IMAGE_SECTION_HEADER *sec;
++        IMAGE_NT_HEADERS *nt;
++        unsigned int i;
++
++        NtQueryVirtualMemory( GetCurrentProcess(), LdrInitializeThunk, MemoryBasicInformation,
++                              &meminfo, sizeof(meminfo), NULL );
++        nt = RtlImageNtHeader( meminfo.AllocationBase );
++        sec = IMAGE_FIRST_SECTION( nt );
++        for (i = 0; i < nt->FileHeader.NumberOfSections; i++, sec++)
++        {
++            if (memcmp( sec->Name, ".mrdata", sizeof(".mrdata") )) continue;
++            mrdata_base = (char *)meminfo.AllocationBase + sec->VirtualAddress;
++            mrdata_size = sec->Misc.VirtualSize;
++            break;
++        }
++    }
++    if (protect)
++    {
++        if (mrdata_unprotected && !--mrdata_unprotected) new_prot = PAGE_READONLY;
++    }
++    else if (!mrdata_unprotected++) new_prot = PAGE_READWRITE;
++
++    if (new_prot && mrdata_base)
++    {
++        void *addr = mrdata_base;
++        SIZE_T size = mrdata_size;
++
++        NtProtectVirtualMemory( NtCurrentProcess(), &addr, &size, new_prot, &old_prot );
++    }
++    RtlReleaseSRWLockExclusive( &mrdata_lock );
++}
++
++
+ #ifdef _WIN64
+ /* convert PE header to 64-bit when loading a 32-bit IL-only module into a 64-bit process */
+ static BOOL convert_to_pe64( HMODULE module, const SECTION_IMAGE_INFORMATION *info )
+@@ -4889,7 +4942,7 @@
+ 
+ static void (WINAPI *pWow64LdrpInitialize)( CONTEXT *ctx );
+ 
+-void (WINAPI *pWow64PrepareForException)( EXCEPTION_RECORD *rec, CONTEXT *context ) = NULL;
++DECLSPEC_ALLOCATE(".mrdata") void (WINAPI *pWow64PrepareForException)( EXCEPTION_RECORD *rec, CONTEXT *context ) = NULL;
+ 
+ static void init_wow64( CONTEXT *context )
+ {
+@@ -4915,6 +4968,7 @@
+         GET_PTR( Wow64LdrpInitialize );
+         GET_PTR( Wow64PrepareForException );
+ #undef GET_PTR
++        ldr_protect_mrdata( TRUE );
+         imports_fixup_done = TRUE;
+     }
+ 
+@@ -5173,6 +5227,7 @@
+                  debugstr_w(NtCurrentTeb()->Peb->ProcessParameters->ImagePathName.Buffer), status );
+             NtTerminateProcess( GetCurrentProcess(), status );
+         }
++        ldr_protect_mrdata( TRUE );
+         release_address_space();
+         if (wm->ldr.TlsIndex == -1) call_tls_callbacks( wm->ldr.DllBase, DLL_PROCESS_ATTACH );
+         if (wm->ldr.ActivationContext) RtlDeactivateActivationContext( 0, cookie );
+--- a/dlls/ntdll/ntdll_misc.h
++++ b/dlls/ntdll/ntdll_misc.h
+@@ -63,6 +63,7 @@
+                                                            CONTEXT *context, void *dispatch );
+ extern void DECLSPEC_NORETURN raise_status( NTSTATUS status, EXCEPTION_RECORD *rec );
+ extern LONG WINAPI call_unhandled_exception_filter( PEXCEPTION_POINTERS eptr );
++extern void ldr_protect_mrdata( BOOL protect );
+ extern void register_module_exception_directory( void *module );
+ extern void unregister_module_exception_directory( void *module );
+ extern void WINAPI process_breakpoint(void);
+--- a/dlls/ntdll/unwind.c
++++ b/dlls/ntdll/unwind.c
+@@ -105,11 +105,8 @@
+ 
+ void register_module_exception_directory( void *module )
+ {
+-    SIZE_T size = sizeof(exception_dir_table);
+     struct module_exception_dir_entry e;
+-    void *addr = &exception_dir_table;
+     IMAGE_NT_HEADERS *nt;
+-    ULONG old_prot;
+     unsigned int i;
+ 
+     if (!(nt = RtlImageNtHeader( module ))) return;
+@@ -120,9 +117,13 @@
+ 
+     RtlEnterCriticalSection( &dynamic_unwind_section );
+ 
+-    if (exception_dir_table.count == MAX_MODULE_EXCEPTION_DIR_ENTRIES) goto done;
++    if (exception_dir_table.count == MAX_MODULE_EXCEPTION_DIR_ENTRIES)
++    {
++        RtlLeaveCriticalSection( &dynamic_unwind_section );
++        return;
++    }
+ 
+-    NtProtectVirtualMemory( NtCurrentProcess(), &addr, &size, PAGE_READWRITE, &old_prot );
++    ldr_protect_mrdata( FALSE );
+     /* First entry is reserved for ntdll regardless of base address order. */
+     if (exception_dir_table.count <= 2)
+     {
+@@ -142,14 +143,12 @@
+     exception_dir_table.entries[i] = e;
+     ++exception_dir_table.count;
+ done:
++    ldr_protect_mrdata( TRUE );
+     RtlLeaveCriticalSection( &dynamic_unwind_section );
+ }
+ 
+ void unregister_module_exception_directory( void *module )
+ {
+-    SIZE_T size = sizeof(exception_dir_table);
+-    void *addr = &exception_dir_table;
+-    ULONG old_prot;
+     unsigned int i;
+ 
+     RtlEnterCriticalSection( &dynamic_unwind_section );
+@@ -157,10 +156,11 @@
+     {
+         if (module == exception_dir_table.entries[i].dllbase)
+         {
+-            NtProtectVirtualMemory( NtCurrentProcess(), &addr, &size, PAGE_READWRITE, &old_prot );
++            ldr_protect_mrdata( FALSE );
+             memmove( &exception_dir_table.entries[i], &exception_dir_table.entries[i + 1],
+                      sizeof(*exception_dir_table.entries) * (exception_dir_table.count - i - 1) );
+             --exception_dir_table.count;
++            ldr_protect_mrdata( TRUE );
+             break;
+         }
+     }

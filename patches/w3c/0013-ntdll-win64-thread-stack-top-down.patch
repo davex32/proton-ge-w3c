@@ -1,0 +1,16 @@
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -4736,7 +4736,12 @@
+ 
+     w3c_virtual_enter( &sigset );
+ 
+-    status = map_view( &view, NULL, size, 0, VPROT_READ | VPROT_WRITE | VPROT_COMMITTED,
++    /* Windows allocates thread stacks top-down from the high end of the user
++     * address space, so 64-bit stacks (and the exception frames built on them)
++     * land above 4GB. Allocate them the same way instead of filling from the
++     * bottom of the address space. */
++    status = map_view( &view, NULL, size, is_win64 ? MEM_TOP_DOWN : 0,
++                       VPROT_READ | VPROT_WRITE | VPROT_COMMITTED,
+                        limit_low, limit_high, 0 );
+     if (status != STATUS_SUCCESS) goto done;
+ 
