@@ -101,6 +101,14 @@ Allocates 64-bit thread stacks top-down from the top of the user address space, 
 
 This matters because the W3Champions in-game handler branches on the address of the exception `CONTEXT` record: it only takes its code-reading path when that address lies above 4 GB, which is always the case on Windows but never with Wine's bottom-up stacks. With the stacks low, the handler looped until the stack overflowed, freezing the game window.
 
+### Cross-process `RevokeDragDrop`
+
+`0014-ole32-revokedragdrop-foreign-process.patch`
+
+Makes `RevokeDragDrop` return `DRAGDROP_E_INVALIDHWND` for a window owned by another process, matching Windows and the check `RegisterDragDrop` already has. Wine instead read that window's drop-target property, a pointer only valid in the owning process, and called `Release` on it.
+
+W3Champions 1.6.28 opens Battle.net sign-in in a new webview window. Tauri's wry layer walks the child windows of each webview host and calls `RevokeDragDrop`/`RegisterDragDrop` on them, expecting `DRAGDROP_E_INVALIDHWND` for WebView2's child windows, which belong to `msedgewebview2.exe`. Under Wine the launcher crashed with an access violation in `ole32!RevokeDragDrop` as soon as **Sign in** was clicked.
+
 ## Already provided by GE-Proton
 
 The GE-Proton11-7 base already contains several fixes needed by this setup, so they are intentionally not duplicated in `patches/w3c/`, including:
@@ -162,7 +170,8 @@ patches/w3c/
 ├── 0008-w3c-process-in-job-limited-access.patch
 ├── 0009-ntdll-protect-mrdata-like-windows.patch
 ├── 0012-server-skip-dead-threads-for-process-memory.patch
-└── 0013-ntdll-win64-thread-stack-top-down.patch
+├── 0013-ntdll-win64-thread-stack-top-down.patch
+└── 0014-ole32-revokedragdrop-foreign-process.patch
 ```
 
 ## Upstream projects

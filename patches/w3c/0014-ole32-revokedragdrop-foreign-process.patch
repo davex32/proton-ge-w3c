@@ -1,0 +1,41 @@
+ole32: Fail RevokeDragDrop with DRAGDROP_E_INVALIDHWND for windows of other processes.
+
+RegisterDragDrop already refuses windows owned by another process. RevokeDragDrop
+did not, and read the OleDropTarget window property, a pointer that is only valid
+in the owning process, then called IDropTarget_Release on it.
+
+wry (Tauri) enumerates the child windows of a WebView2 host window and calls
+RevokeDragDrop/RegisterDragDrop on each, expecting DRAGDROP_E_INVALIDHWND for
+WebView2's child windows, which belong to msedgewebview2.exe. Under Wine this
+crashed W3Champions 1.6.28 with an access violation when its sign-in window opened.
+
+diff --git a/dlls/ole32/ole2.c b/dlls/ole32/ole2.c
+index b37b5b0e..61414836 100644
+--- a/dlls/ole32/ole2.c
++++ b/dlls/ole32/ole2.c
+@@ -618,6 +618,7 @@ HRESULT WINAPI RegisterDragDrop(HWND hwnd, LPDROPTARGET pDropTarget)
+  */
+ HRESULT WINAPI RevokeDragDrop(HWND hwnd)
+ {
++  DWORD pid = 0;
+   HANDLE map;
+   IStream *stream;
+   IDropTarget *drop_target;
+@@ -631,6 +632,17 @@ HRESULT WINAPI RevokeDragDrop(HWND hwnd)
+     return DRAGDROP_E_INVALIDHWND;
+   }
+ 
++  /* Like RegisterDragDrop, refuse windows of other processes: their
++   * OleDropTarget property holds a pointer that is only valid in the owning
++   * process (e.g. WebView2's msedgewebview2.exe child windows). Windows returns
++   * DRAGDROP_E_INVALIDHWND here, which callers such as wry rely on. */
++  GetWindowThreadProcessId(hwnd, &pid);
++  if (pid != GetCurrentProcessId())
++  {
++    TRACE("hwnd %p belongs to another process\n", hwnd);
++    return DRAGDROP_E_INVALIDHWND;
++  }
++
+   /* no registration data */
+   if (!(map = get_droptarget_handle(hwnd)))
+     return DRAGDROP_E_NOTREGISTERED;
